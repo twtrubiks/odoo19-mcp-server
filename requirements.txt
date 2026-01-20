@@ -1,0 +1,2 @@
+fastmcp==2.14.3
+odoo-client-lib==2.0.0
