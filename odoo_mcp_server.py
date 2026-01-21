@@ -62,6 +62,11 @@ def check_readonly_mode(operation: str) -> None:
         )
 
 
+def build_record_url(model: str, record_id: int) -> str:
+    """Build Odoo record URL for direct browser access."""
+    return f"{ODOO_URL}/odoo/{model}/{record_id}"
+
+
 # =============================================================================
 # Odoo JSON-RPC Client
 # =============================================================================
@@ -336,11 +341,18 @@ def search_records(
         order: Sort order (e.g., 'name asc', 'create_date desc')
 
     Returns:
-        JSON with records, total count, limit, and offset
+        JSON with records, total count, limit, and offset.
+        Each record includes a '_url' field for direct browser access.
     """
     domain = domain or []
     records = client.search_read(model, domain, fields=fields, limit=limit, offset=offset, order=order)
     total = client.search_count(model, domain)
+
+    # Add URL to each record
+    for record in records:
+        if "id" in record:
+            record["_url"] = build_record_url(model, record["id"])
+
     result = {
         "records": records,
         "total": total,
@@ -390,9 +402,16 @@ def read_records(
         fields: Fields to return (None for all)
 
     Returns:
-        JSON string with the records
+        JSON string with the records. Each record includes a '_url' field
+        for direct browser access to that record.
     """
     records = client.read(model, ids, fields=fields)
+
+    # Add URL to each record
+    for record in records:
+        if "id" in record:
+            record["_url"] = build_record_url(model, record["id"])
+
     return json.dumps(records, indent=2, ensure_ascii=False, default=format_datetime)
 
 
@@ -410,14 +429,30 @@ def create_record(
         values: Dictionary of field values, or list of dicts for batch creation
 
     Returns:
-        JSON string with the new record ID(s)
+        JSON string containing:
+        - Single creation: {"id": int, "success": bool, "url": str}
+        - Batch creation: {"ids": list[int], "count": int, "success": bool, "urls": list[str]}
+
+        The 'url' field provides direct browser access to the created record(s).
+
+    Note:
+        In READONLY_MODE, this operation is blocked.
     """
     check_readonly_mode("create")
     result = client.create(model, values)
     if isinstance(values, list):
         ids = result if isinstance(result, list) else [result]
-        return json.dumps({"ids": ids, "count": len(ids), "success": True}, indent=2)
-    return json.dumps({"id": result, "success": True}, indent=2)
+        return json.dumps({
+            "ids": ids,
+            "count": len(ids),
+            "success": True,
+            "urls": [build_record_url(model, id) for id in ids],
+        }, indent=2)
+    return json.dumps({
+        "id": result,
+        "success": True,
+        "url": build_record_url(model, result),
+    }, indent=2)
 
 
 @mcp.tool()
@@ -436,11 +471,30 @@ def update_record(
         values: Dictionary of field values to update
 
     Returns:
-        JSON string with success status
+        JSON string with:
+        - success: Boolean indicating operation result
+        - updated_ids: List of record IDs
+        - urls: List of browser URLs (only if success=True)
+        - error: Error message (only if success=False)
+
+    Note:
+        In READONLY_MODE, this operation is blocked.
     """
     check_readonly_mode("write")
     result = client.write(model, ids, values)
-    return json.dumps({"success": result, "updated_ids": ids}, indent=2)
+
+    if result:
+        return json.dumps({
+            "success": True,
+            "updated_ids": ids,
+            "urls": [build_record_url(model, id) for id in ids],
+        }, indent=2)
+    else:
+        return json.dumps({
+            "success": False,
+            "updated_ids": ids,
+            "error": "Update operation failed",
+        }, indent=2)
 
 
 @mcp.tool()
