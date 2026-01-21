@@ -101,12 +101,15 @@ class OdooJsonRpcClient:
         fields: list[str] | None = None,
         limit: int = 100,
         offset: int = 0,
+        order: str | None = None,
     ) -> list[dict]:
         """Search and read records in one call."""
         model_proxy = self.get_model(model)
         kwargs: dict[str, Any] = {"limit": limit, "offset": offset}
         if fields:
             kwargs["fields"] = fields
+        if order:
+            kwargs["order"] = order
         return model_proxy.search_read(domain, **kwargs)
 
     def create(self, model: str, values: dict) -> int:
@@ -149,7 +152,7 @@ mcp = FastMCP("Odoo MCP Server (JSON-RPC)")
 # =============================================================================
 
 @mcp.resource("odoo://models")
-def list_models(client: OdooJsonRpcClient = Depends(get_odoo_client)) -> str:
+def list_models_resource(client: OdooJsonRpcClient = Depends(get_odoo_client)) -> str:
     """List all available Odoo models."""
     records = client.search_read(
         "ir.model",
@@ -186,6 +189,32 @@ def get_record(model_name: str, record_id: int, client: OdooJsonRpcClient = Depe
 # =============================================================================
 
 @mcp.tool()
+def list_models(
+    name_filter: str | None = None,
+    client: OdooJsonRpcClient = Depends(get_odoo_client),
+) -> str:
+    """
+    List all available Odoo models.
+
+    Args:
+        name_filter: Optional filter for model name (e.g., 'sale' to find sale-related models)
+
+    Returns:
+        JSON string with model names and descriptions
+    """
+    domain = []
+    if name_filter:
+        domain = ["|", ("model", "ilike", name_filter), ("name", "ilike", name_filter)]
+    records = client.search_read(
+        "ir.model",
+        domain,
+        fields=["model", "name"],
+        limit=500,
+    )
+    return json.dumps(records, indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
 def execute_method(
     model: str,
     method: str,
@@ -218,6 +247,7 @@ def search_records(
     fields: list[str] | None = None,
     limit: int = 100,
     offset: int = 0,
+    order: str | None = None,
     client: OdooJsonRpcClient = Depends(get_odoo_client),
 ) -> str:
     """
@@ -229,12 +259,13 @@ def search_records(
         fields: Fields to return (None for all)
         limit: Maximum number of records
         offset: Number of records to skip
+        order: Sort order (e.g., 'name asc', 'create_date desc')
 
     Returns:
         JSON string with matching records
     """
     domain = domain or []
-    records = client.search_read(model, domain, fields=fields, limit=limit, offset=offset)
+    records = client.search_read(model, domain, fields=fields, limit=limit, offset=offset, order=order)
     return json.dumps(records, indent=2, ensure_ascii=False, default=str)
 
 
