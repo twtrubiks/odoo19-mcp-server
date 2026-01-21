@@ -22,6 +22,7 @@ import odoolib
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 from fastmcp.dependencies import Depends
+from fastmcp.exceptions import ToolError
 
 load_dotenv()
 
@@ -59,7 +60,7 @@ DANGEROUS_FIELD_TYPES = {"binary", "image", "html"}
 def check_readonly_mode(operation: str) -> None:
     """Check if operation is allowed in readonly mode."""
     if READONLY_MODE and operation in WRITE_METHODS:
-        raise ValueError(
+        raise ToolError(
             f"Operation '{operation}' is not allowed in READONLY_MODE. "
             "Set READONLY_MODE=false to enable write operations."
         )
