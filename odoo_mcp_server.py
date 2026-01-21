@@ -159,7 +159,7 @@ async def get_odoo_client():
     yield client
 
 
-mcp = FastMCP("Odoo MCP Server (JSON-RPC)")
+mcp = FastMCP("Odoo MCP Server (JSON-RPC)", mask_error_details=True)
 
 
 # =============================================================================
