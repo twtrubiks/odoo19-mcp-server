@@ -14,6 +14,7 @@ import os
 import json
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import date, datetime
 from typing import Any
 
 import odoolib
@@ -30,6 +31,20 @@ load_dotenv()
 ODOO_URL = os.getenv("ODOO_URL", "http://localhost:8019")
 ODOO_DATABASE = os.getenv("ODOO_DATABASE", "your_database_key_here")
 ODOO_API_KEY = os.getenv("ODOO_API_KEY", "your_api_key_here")
+
+
+# =============================================================================
+# Helper Functions
+# =============================================================================
+
+
+def format_datetime(obj: Any) -> str:
+    """Format datetime objects to ISO 8601 string."""
+    if isinstance(obj, datetime):
+        return obj.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(obj, date):
+        return obj.strftime("%Y-%m-%d")
+    return str(obj)
 
 
 # =============================================================================
@@ -180,7 +195,7 @@ def get_record(model_name: str, record_id: int, client: OdooJsonRpcClient = Depe
     """Get a single record by ID."""
     records = client.read(model_name, [int(record_id)])
     if records:
-        return json.dumps(records[0], indent=2, ensure_ascii=False, default=str)
+        return json.dumps(records[0], indent=2, ensure_ascii=False, default=format_datetime)
     return json.dumps({"error": "Record not found"})
 
 
@@ -215,6 +230,34 @@ def list_models(
 
 
 @mcp.tool()
+def get_fields(
+    model: str,
+    field_filter: str | None = None,
+    client: OdooJsonRpcClient = Depends(get_odoo_client),
+) -> str:
+    """
+    Get field information for an Odoo model.
+
+    Args:
+        model: Model name (e.g., 'res.partner')
+        field_filter: Optional filter for field name (e.g., 'name' to find name-related fields)
+
+    Returns:
+        JSON string with field definitions
+    """
+    domain = [("model", "=", model)]
+    if field_filter:
+        domain.append(("name", "ilike", field_filter))
+    records = client.search_read(
+        "ir.model.fields",
+        domain,
+        fields=["name", "field_description", "ttype", "required", "readonly"],
+        limit=200,
+    )
+    return json.dumps(records, indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
 def execute_method(
     model: str,
     method: str,
@@ -237,7 +280,7 @@ def execute_method(
     args = args or []
     kwargs = kwargs or {}
     result = client.execute(model, method, *args, **kwargs)
-    return json.dumps(result, indent=2, ensure_ascii=False, default=str)
+    return json.dumps(result, indent=2, ensure_ascii=False, default=format_datetime)
 
 
 @mcp.tool()
@@ -266,7 +309,7 @@ def search_records(
     """
     domain = domain or []
     records = client.search_read(model, domain, fields=fields, limit=limit, offset=offset, order=order)
-    return json.dumps(records, indent=2, ensure_ascii=False, default=str)
+    return json.dumps(records, indent=2, ensure_ascii=False, default=format_datetime)
 
 
 @mcp.tool()
@@ -309,7 +352,7 @@ def read_records(
         JSON string with the records
     """
     records = client.read(model, ids, fields=fields)
-    return json.dumps(records, indent=2, ensure_ascii=False, default=str)
+    return json.dumps(records, indent=2, ensure_ascii=False, default=format_datetime)
 
 
 @mcp.tool()
