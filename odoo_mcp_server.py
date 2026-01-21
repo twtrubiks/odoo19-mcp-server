@@ -10,8 +10,9 @@ Environment Variables:
     ODOO_API_KEY: API key for authentication
 """
 
-import os
+import argparse
 import json
+import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -432,4 +433,18 @@ def delete_record(
 # =============================================================================
 
 if __name__ == "__main__":
-    mcp.run()
+    parser = argparse.ArgumentParser(description="Odoo MCP Server (JSON-RPC)")
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "http", "sse"],
+        default="stdio",
+        help="Transport layer: stdio (CLI), http (Streamable HTTP), sse (Server-Sent Events)",
+    )
+    parser.add_argument("--host", default="127.0.0.1", help="Host for HTTP/SSE transport")
+    parser.add_argument("--port", type=int, default=8000, help="Port for HTTP/SSE transport")
+    args = parser.parse_args()
+
+    if args.transport == "stdio":
+        mcp.run()
+    else:
+        mcp.run(transport=args.transport, host=args.host, port=args.port)
