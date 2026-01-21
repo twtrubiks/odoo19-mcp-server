@@ -339,7 +339,7 @@ def get_current_company(client: OdooJsonRpcClient = Depends(get_shared_client)) 
 # Tools
 # =============================================================================
 
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True})
 def list_models(
     name_filter: str | None = None,
     client: OdooJsonRpcClient = Depends(get_shared_client),
@@ -380,7 +380,7 @@ DEFAULT_FIELD_ATTRIBUTES = [
 ]
 
 
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True})
 def get_fields(
     model: str,
     field_filter: str | None = None,
@@ -462,7 +462,7 @@ def execute_method(
     return json.dumps(result, indent=2, ensure_ascii=False, default=format_datetime)
 
 
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True})
 def search_records(
     model: str,
     domain: list | None = None,
@@ -515,7 +515,7 @@ def search_records(
     return json.dumps(result, indent=2, ensure_ascii=False, default=format_datetime)
 
 
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True})
 def count_records(
     model: str,
     domain: list | None = None,
@@ -541,7 +541,7 @@ def count_records(
     return json.dumps({"model": model, "count": count}, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True})
 def read_records(
     model: str,
     ids: list[int],
@@ -616,7 +616,7 @@ def create_record(
     }, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations={"idempotentHint": True})
 def update_record(
     model: str,
     ids: list[int],
@@ -658,7 +658,7 @@ def update_record(
         }, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations={"destructiveHint": True, "idempotentHint": True})
 def delete_record(
     model: str,
     ids: list[int],
