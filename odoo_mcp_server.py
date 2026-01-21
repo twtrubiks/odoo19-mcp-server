@@ -362,7 +362,8 @@ def search_records(
             - Simple: [["name", "=", "John"]]
             - Multiple (AND): [["is_company", "=", True], ["active", "=", True]]
             - OR condition: ["|", ["name", "ilike", "test"], ["email", "ilike", "test"]]
-            - Operators: =, !=, >, >=, <, <=, like, ilike, in, not in, child_of
+            - any (Odoo 19+): [["order_line", "any", [["product_uom_qty", ">", 5]]]]
+            - Operators: =, !=, >, >=, <, <=, like, ilike, in, not in, child_of, any
         fields: Fields to return (None = auto-exclude dangerous fields like binary/image/html)
         limit: Maximum number of records
         offset: Number of records to skip
@@ -410,6 +411,8 @@ def count_records(
             - Simple: [["active", "=", True]]
             - Multiple (AND): [["is_company", "=", True], ["country_id", "=", 1]]
             - OR condition: ["|", ["type", "=", "contact"], ["type", "=", "invoice"]]
+            - any (Odoo 19+): [["order_line", "any", [["product_uom_qty", ">", 5]]]]
+            - Operators: =, !=, >, >=, <, <=, like, ilike, in, not in, child_of, any
 
     Returns:
         JSON string with the count
