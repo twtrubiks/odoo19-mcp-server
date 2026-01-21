@@ -82,6 +82,11 @@ class OdooJsonRpcClient:
         model_proxy = self.get_model(model)
         return model_proxy.search(domain, limit=limit, offset=offset)
 
+    def search_count(self, model: str, domain: list) -> int:
+        """Count records matching the domain."""
+        model_proxy = self.get_model(model)
+        return model_proxy.search_count(domain)
+
     def read(self, model: str, ids: list[int], fields: list[str] | None = None) -> list[dict]:
         """Read records by IDs."""
         model_proxy = self.get_model(model)
@@ -231,6 +236,27 @@ def search_records(
     domain = domain or []
     records = client.search_read(model, domain, fields=fields, limit=limit, offset=offset)
     return json.dumps(records, indent=2, ensure_ascii=False, default=str)
+
+
+@mcp.tool()
+def count_records(
+    model: str,
+    domain: list | None = None,
+    client: OdooJsonRpcClient = Depends(get_odoo_client),
+) -> str:
+    """
+    Count records in an Odoo model matching the domain.
+
+    Args:
+        model: Model name (e.g., 'res.partner')
+        domain: Search domain (e.g., [['is_company', '=', True]])
+
+    Returns:
+        JSON string with the count
+    """
+    domain = domain or []
+    count = client.search_count(model, domain)
+    return json.dumps({"model": model, "count": count}, indent=2)
 
 
 @mcp.tool()
