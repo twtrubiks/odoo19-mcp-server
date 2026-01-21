@@ -17,17 +17,19 @@ from dataclasses import dataclass
 from typing import Any
 
 import odoolib
+from dotenv import load_dotenv
 from fastmcp import FastMCP
 from fastmcp.dependencies import Depends
 
+load_dotenv()
 
 # =============================================================================
 # Configuration
 # =============================================================================
 
 ODOO_URL = os.getenv("ODOO_URL", "http://localhost:8019")
-ODOO_DATABASE = os.getenv("ODOO_DATABASE", "odoo19_demo")
-ODOO_API_KEY = os.getenv("ODOO_API_KEY", "7e3f7dfdbaf02e42b72e5e6f83cd843eb25f804d")
+ODOO_DATABASE = os.getenv("ODOO_DATABASE", "your_database_key_here")
+ODOO_API_KEY = os.getenv("ODOO_API_KEY", "your_api_key_here")
 
 
 # =============================================================================
