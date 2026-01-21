@@ -74,6 +74,7 @@ def build_record_url(model: str, record_id: int) -> str:
 def get_safe_fields(client: "OdooJsonRpcClient", model: str) -> list[str]:
     """取得排除危險欄位後的安全欄位列表
 
+    使用 ORM fields_get() 取得欄位資訊，
     自動排除 binary、image、html 類型的欄位，
     避免回傳過大的 base64 資料。
 
@@ -84,13 +85,13 @@ def get_safe_fields(client: "OdooJsonRpcClient", model: str) -> list[str]:
     Returns:
         安全欄位名稱列表
     """
-    fields_info = client.search_read(
-        "ir.model.fields",
-        [("model", "=", model)],
-        fields=["name", "ttype"],
-        limit=500,
-    )
-    return [f["name"] for f in fields_info if f["ttype"] not in DANGEROUS_FIELD_TYPES]
+    # 使用 fields_get() 取得欄位類型資訊（效能較佳）
+    fields_data = client.fields_get(model, attributes=["type"])
+    return [
+        field_name
+        for field_name, field_info in fields_data.items()
+        if field_info.get("type") not in DANGEROUS_FIELD_TYPES
+    ]
 
 
 # =============================================================================
@@ -193,6 +194,30 @@ class OdooJsonRpcClient:
         model_proxy = self.get_model(model)
         return getattr(model_proxy, method)(*args, **kwargs)
 
+    def fields_get(
+        self,
+        model: str,
+        allfields: list[str] | None = None,
+        attributes: list[str] | None = None,
+    ) -> dict[str, dict]:
+        """使用 ORM fields_get() 取得欄位定義。
+
+        Args:
+            model: 模型名稱 (e.g., 'res.partner')
+            allfields: 指定要取得的欄位名稱列表，None 表示全部
+            attributes: 指定要返回的屬性列表，None 表示全部
+
+        Returns:
+            欄位定義字典，key 為欄位名稱
+        """
+        model_proxy = self.get_model(model)
+        kwargs = {}
+        if allfields:
+            kwargs["allfields"] = allfields
+        if attributes:
+            kwargs["attributes"] = attributes
+        return model_proxy.fields_get(**kwargs)
+
 
 # =============================================================================
 # MCP Server Setup
@@ -234,14 +259,25 @@ def list_models_resource(client: OdooJsonRpcClient = Depends(get_shared_client))
 
 @mcp.resource("odoo://model/{model_name}")
 def get_model_fields(model_name: str, client: OdooJsonRpcClient = Depends(get_shared_client)) -> str:
-    """Get field information for a specific model."""
-    records = client.search_read(
-        "ir.model.fields",
-        [("model", "=", model_name)],
-        fields=["name", "field_description", "ttype", "required", "readonly"],
-        limit=200,
+    """Get field information for a specific model using ORM fields_get()."""
+    # 使用 fields_get() 取得更完整的欄位資訊
+    fields_data = client.fields_get(
+        model_name,
+        attributes=["type", "string", "help", "required", "readonly", "store",
+                   "selection", "comodel_name", "inverse_name", "domain"],
     )
-    return json.dumps(records, indent=2, ensure_ascii=False)
+
+    # 轉換為列表格式
+    result = []
+    for field_name, field_info in fields_data.items():
+        field_dict = {"name": field_name}
+        field_dict.update(field_info)
+        result.append(field_dict)
+
+    # 按欄位名稱排序
+    result.sort(key=lambda x: x["name"])
+
+    return json.dumps(result, indent=2, ensure_ascii=False)
 
 
 @mcp.resource("odoo://record/{model_name}/{record_id}")
@@ -285,32 +321,71 @@ def list_models(
     return json.dumps(records, indent=2, ensure_ascii=False)
 
 
+# 預設返回的欄位屬性
+DEFAULT_FIELD_ATTRIBUTES = [
+    "type",
+    "string",
+    "help",
+    "required",
+    "readonly",
+    "store",
+    "selection",      # Selection 欄位的選項
+    "comodel_name",   # Many2one/One2many/Many2many 關聯模型
+    "inverse_name",   # One2many 反向欄位
+    "domain",         # 關聯欄位的 domain
+]
+
+
 @mcp.tool()
 def get_fields(
     model: str,
     field_filter: str | None = None,
+    fields: list[str] | None = None,
+    attributes: list[str] | None = None,
     client: OdooJsonRpcClient = Depends(get_shared_client),
 ) -> str:
     """
-    Get field information for an Odoo model.
+    Get field information for an Odoo model using ORM fields_get().
 
     Args:
         model: Model name (e.g., 'res.partner')
         field_filter: Optional filter for field name (e.g., 'name' to find name-related fields)
+        fields: Specific field names to retrieve (None = all fields)
+        attributes: Field attributes to return (None = default attributes including
+                   type, string, help, required, readonly, store, selection,
+                   comodel_name, inverse_name, domain)
 
     Returns:
-        JSON string with field definitions
+        JSON array of field definitions. Each field includes:
+        - name: Field name
+        - type: Field type (char, integer, many2one, selection, etc.)
+        - string: Human-readable label
+        - required: Whether field is required
+        - readonly: Whether field is readonly
+        - selection: List of [value, label] pairs (for selection fields)
+        - comodel_name: Related model name (for relational fields)
     """
-    domain = [("model", "=", model)]
-    if field_filter:
-        domain.append(("name", "ilike", field_filter))
-    records = client.search_read(
-        "ir.model.fields",
-        domain,
-        fields=["name", "field_description", "ttype", "required", "readonly"],
-        limit=200,
-    )
-    return json.dumps(records, indent=2, ensure_ascii=False)
+    # 使用預設屬性或自訂屬性
+    attrs = attributes or DEFAULT_FIELD_ATTRIBUTES
+
+    # 取得欄位資訊
+    fields_data = client.fields_get(model, allfields=fields, attributes=attrs)
+
+    # 轉換為列表格式，並加入欄位名稱
+    result = []
+    for field_name, field_info in fields_data.items():
+        # 套用 field_filter 過濾
+        if field_filter and field_filter.lower() not in field_name.lower():
+            continue
+
+        field_dict = {"name": field_name}
+        field_dict.update(field_info)
+        result.append(field_dict)
+
+    # 按欄位名稱排序
+    result.sort(key=lambda x: x["name"])
+
+    return json.dumps(result, indent=2, ensure_ascii=False)
 
 
 @mcp.tool()
