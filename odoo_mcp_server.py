@@ -127,8 +127,8 @@ class OdooJsonRpcClient:
             kwargs["order"] = order
         return model_proxy.search_read(domain, **kwargs)
 
-    def create(self, model: str, values: dict) -> int:
-        """Create a new record."""
+    def create(self, model: str, values: dict | list[dict]) -> int | list[int]:
+        """Create new record(s). Supports single dict or list of dicts for batch creation."""
         model_proxy = self.get_model(model)
         return model_proxy.create(values)
 
@@ -365,21 +365,24 @@ def read_records(
 @mcp.tool()
 def create_record(
     model: str,
-    values: dict,
+    values: dict | list[dict],
     client: OdooJsonRpcClient = Depends(get_odoo_client),
 ) -> str:
     """
-    Create a new record in an Odoo model.
+    Create new record(s) in an Odoo model.
 
     Args:
         model: Model name (e.g., 'res.partner')
-        values: Dictionary of field values
+        values: Dictionary of field values, or list of dicts for batch creation
 
     Returns:
-        JSON string with the new record ID
+        JSON string with the new record ID(s)
     """
-    record_id = client.create(model, values)
-    return json.dumps({"id": record_id, "success": True}, indent=2)
+    result = client.create(model, values)
+    if isinstance(values, list):
+        ids = result if isinstance(result, list) else [result]
+        return json.dumps({"ids": ids, "count": len(ids), "success": True}, indent=2)
+    return json.dumps({"id": result, "success": True}, indent=2)
 
 
 @mcp.tool()
