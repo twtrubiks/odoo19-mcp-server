@@ -299,7 +299,11 @@ def search_records(
 
     Args:
         model: Model name (e.g., 'res.partner')
-        domain: Search domain (e.g., [['is_company', '=', True]])
+        domain: Odoo search domain (list of conditions). Examples:
+            - Simple: [["name", "=", "John"]]
+            - Multiple (AND): [["is_company", "=", True], ["active", "=", True]]
+            - OR condition: ["|", ["name", "ilike", "test"], ["email", "ilike", "test"]]
+            - Operators: =, !=, >, >=, <, <=, like, ilike, in, not in, child_of
         fields: Fields to return (None for all)
         limit: Maximum number of records
         offset: Number of records to skip
@@ -331,7 +335,10 @@ def count_records(
 
     Args:
         model: Model name (e.g., 'res.partner')
-        domain: Search domain (e.g., [['is_company', '=', True]])
+        domain: Odoo search domain (list of conditions). Examples:
+            - Simple: [["active", "=", True]]
+            - Multiple (AND): [["is_company", "=", True], ["country_id", "=", 1]]
+            - OR condition: ["|", ["type", "=", "contact"], ["type", "=", "invoice"]]
 
     Returns:
         JSON string with the count
