@@ -305,11 +305,18 @@ def search_records(
         order: Sort order (e.g., 'name asc', 'create_date desc')
 
     Returns:
-        JSON string with matching records
+        JSON with records, total count, limit, and offset
     """
     domain = domain or []
     records = client.search_read(model, domain, fields=fields, limit=limit, offset=offset, order=order)
-    return json.dumps(records, indent=2, ensure_ascii=False, default=format_datetime)
+    total = client.search_count(model, domain)
+    result = {
+        "records": records,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
+    return json.dumps(result, indent=2, ensure_ascii=False, default=format_datetime)
 
 
 @mcp.tool()
