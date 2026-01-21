@@ -8,6 +8,7 @@ Environment Variables:
     ODOO_URL: Odoo server URL (default: http://localhost:8069)
     ODOO_DATABASE: Database name (default: odoo)
     ODOO_API_KEY: API key for authentication
+    READONLY_MODE: Set to "true" to disable write operations (default: false)
 """
 
 import argparse
@@ -32,6 +33,7 @@ load_dotenv()
 ODOO_URL = os.getenv("ODOO_URL", "http://localhost:8019")
 ODOO_DATABASE = os.getenv("ODOO_DATABASE", "your_database_key_here")
 ODOO_API_KEY = os.getenv("ODOO_API_KEY", "your_api_key_here")
+READONLY_MODE = os.getenv("READONLY_MODE", "false").lower() == "true"
 
 
 # =============================================================================
@@ -46,6 +48,19 @@ def format_datetime(obj: Any) -> str:
     if isinstance(obj, date):
         return obj.strftime("%Y-%m-%d")
     return str(obj)
+
+
+# Write operations that should be blocked in READONLY_MODE
+WRITE_METHODS = {"create", "write", "unlink", "copy"}
+
+
+def check_readonly_mode(operation: str) -> None:
+    """Check if operation is allowed in readonly mode."""
+    if READONLY_MODE and operation in WRITE_METHODS:
+        raise ValueError(
+            f"Operation '{operation}' is not allowed in READONLY_MODE. "
+            "Set READONLY_MODE=false to enable write operations."
+        )
 
 
 # =============================================================================
@@ -277,7 +292,11 @@ def execute_method(
 
     Returns:
         JSON string with the method result
+
+    Note:
+        In READONLY_MODE, write methods (create, write, unlink, copy) are blocked.
     """
+    check_readonly_mode(method)
     args = args or []
     kwargs = kwargs or {}
     result = client.execute(model, method, *args, **kwargs)
@@ -386,6 +405,7 @@ def create_record(
     Returns:
         JSON string with the new record ID(s)
     """
+    check_readonly_mode("create")
     result = client.create(model, values)
     if isinstance(values, list):
         ids = result if isinstance(result, list) else [result]
@@ -411,6 +431,7 @@ def update_record(
     Returns:
         JSON string with success status
     """
+    check_readonly_mode("write")
     result = client.write(model, ids, values)
     return json.dumps({"success": result, "updated_ids": ids}, indent=2)
 
@@ -431,6 +452,7 @@ def delete_record(
     Returns:
         JSON string with success status
     """
+    check_readonly_mode("unlink")
     result = client.unlink(model, ids)
     return json.dumps({"success": result, "deleted_ids": ids}, indent=2)
 
@@ -450,6 +472,9 @@ if __name__ == "__main__":
     parser.add_argument("--host", default="127.0.0.1", help="Host for HTTP/SSE transport")
     parser.add_argument("--port", type=int, default=8000, help="Port for HTTP/SSE transport")
     args = parser.parse_args()
+
+    if READONLY_MODE:
+        print("⚠️  READONLY_MODE is enabled. Write operations are disabled.")
 
     if args.transport == "stdio":
         mcp.run()
