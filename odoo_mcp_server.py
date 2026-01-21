@@ -52,6 +52,9 @@ def format_datetime(obj: Any) -> str:
 # Write operations that should be blocked in READONLY_MODE
 WRITE_METHODS = {"create", "write", "unlink", "copy"}
 
+# Dangerous field types (excluded by default to avoid large base64 data)
+DANGEROUS_FIELD_TYPES = {"binary", "image", "html"}
+
 
 def check_readonly_mode(operation: str) -> None:
     """Check if operation is allowed in readonly mode."""
@@ -65,6 +68,28 @@ def check_readonly_mode(operation: str) -> None:
 def build_record_url(model: str, record_id: int) -> str:
     """Build Odoo record URL for direct browser access."""
     return f"{ODOO_URL}/odoo/{model}/{record_id}"
+
+
+def get_safe_fields(client: "OdooJsonRpcClient", model: str) -> list[str]:
+    """取得排除危險欄位後的安全欄位列表
+
+    自動排除 binary、image、html 類型的欄位，
+    避免回傳過大的 base64 資料。
+
+    Args:
+        client: Odoo JSON-RPC 客戶端
+        model: 模型名稱 (e.g., 'res.partner')
+
+    Returns:
+        安全欄位名稱列表
+    """
+    fields_info = client.search_read(
+        "ir.model.fields",
+        [("model", "=", model)],
+        fields=["name", "ttype"],
+        limit=500,
+    )
+    return [f["name"] for f in fields_info if f["ttype"] not in DANGEROUS_FIELD_TYPES]
 
 
 # =============================================================================
@@ -220,8 +245,10 @@ def get_model_fields(model_name: str, client: OdooJsonRpcClient = Depends(get_sh
 
 @mcp.resource("odoo://record/{model_name}/{record_id}")
 def get_record(model_name: str, record_id: int, client: OdooJsonRpcClient = Depends(get_shared_client)) -> str:
-    """Get a single record by ID."""
-    records = client.read(model_name, [int(record_id)])
+    """Get a single record by ID (auto-excludes dangerous fields like binary/image/html)."""
+    # 自動排除危險欄位（binary、image、html）
+    fields = get_safe_fields(client, model_name)
+    records = client.read(model_name, [int(record_id)], fields=fields)
     if records:
         return json.dumps(records[0], indent=2, ensure_ascii=False, default=format_datetime)
     return json.dumps({"error": "Record not found"})
@@ -335,7 +362,7 @@ def search_records(
             - Multiple (AND): [["is_company", "=", True], ["active", "=", True]]
             - OR condition: ["|", ["name", "ilike", "test"], ["email", "ilike", "test"]]
             - Operators: =, !=, >, >=, <, <=, like, ilike, in, not in, child_of
-        fields: Fields to return (None for all)
+        fields: Fields to return (None = auto-exclude dangerous fields like binary/image/html)
         limit: Maximum number of records
         offset: Number of records to skip
         order: Sort order (e.g., 'name asc', 'create_date desc')
@@ -345,6 +372,11 @@ def search_records(
         Each record includes a '_url' field for direct browser access.
     """
     domain = domain or []
+
+    # 當 fields=None 時，自動排除危險欄位（binary、image、html）
+    if fields is None:
+        fields = get_safe_fields(client, model)
+
     records = client.search_read(model, domain, fields=fields, limit=limit, offset=offset, order=order)
     total = client.search_count(model, domain)
 
@@ -399,12 +431,16 @@ def read_records(
     Args:
         model: Model name (e.g., 'res.partner')
         ids: List of record IDs to read
-        fields: Fields to return (None for all)
+        fields: Fields to return (None = auto-exclude dangerous fields like binary/image/html)
 
     Returns:
         JSON string with the records. Each record includes a '_url' field
         for direct browser access to that record.
     """
+    # 當 fields=None 時，自動排除危險欄位（binary、image、html）
+    if fields is None:
+        fields = get_safe_fields(client, model)
+
     records = client.read(model, ids, fields=fields)
 
     # Add URL to each record
