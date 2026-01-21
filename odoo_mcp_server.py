@@ -14,6 +14,7 @@ Environment Variables:
 import argparse
 import json
 import os
+import sys
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
@@ -696,7 +697,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if READONLY_MODE:
-        print("⚠️  READONLY_MODE is enabled. Write operations are disabled.")
+        print("⚠️  READONLY_MODE is enabled. Write operations are disabled.", file=sys.stderr)
 
     if args.transport == "stdio":
         mcp.run()
