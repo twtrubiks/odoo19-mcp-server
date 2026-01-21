@@ -218,6 +218,14 @@ class OdooJsonRpcClient:
             kwargs["attributes"] = attributes
         return model_proxy.fields_get(**kwargs)
 
+    def get_user_context(self) -> dict:
+        """取得當前用戶的 context（包含 uid, lang, tz 等）"""
+        return self.connection.get_user_context()
+
+    def get_current_uid(self) -> int | None:
+        """取得當前用戶 ID"""
+        return self.get_user_context().get("uid")
+
 
 # =============================================================================
 # MCP Server Setup
@@ -289,6 +297,42 @@ def get_record(model_name: str, record_id: int, client: OdooJsonRpcClient = Depe
     if records:
         return json.dumps(records[0], indent=2, ensure_ascii=False, default=format_datetime)
     return json.dumps({"error": "Record not found"})
+
+
+@mcp.resource("odoo://user")
+def get_current_user(client: OdooJsonRpcClient = Depends(get_shared_client)) -> str:
+    """Get current logged-in user information."""
+    uid = client.get_current_uid()
+    if uid is None:
+        return json.dumps({"error": "Not authenticated"})
+    fields = get_safe_fields(client, "res.users")
+    user_data = client.read("res.users", [uid], fields=fields)
+    if user_data:
+        user = user_data[0]
+        user["_url"] = build_record_url("res.users", uid)
+        return json.dumps(user, indent=2, ensure_ascii=False, default=format_datetime)
+    return json.dumps({"error": "User not found"})
+
+
+@mcp.resource("odoo://company")
+def get_current_company(client: OdooJsonRpcClient = Depends(get_shared_client)) -> str:
+    """Get current user's company information."""
+    # 先取得當前用戶
+    uid = client.get_current_uid()
+    if uid is None:
+        return json.dumps({"error": "Not authenticated"})
+    user_data = client.read("res.users", [uid], fields=["company_id"])
+
+    if user_data and user_data[0].get("company_id"):
+        company_id = user_data[0]["company_id"][0]  # Many2one 返回 [id, name]
+        fields = get_safe_fields(client, "res.company")
+        company_data = client.read("res.company", [company_id], fields=fields)
+        if company_data:
+            company = company_data[0]
+            company["_url"] = build_record_url("res.company", company_id)
+            return json.dumps(company, indent=2, ensure_ascii=False, default=format_datetime)
+
+    return json.dumps({"error": "Company not found"})
 
 
 # =============================================================================
@@ -563,10 +607,12 @@ def create_record(
             "success": True,
             "urls": [build_record_url(model, id) for id in ids],
         }, indent=2)
+    # Single record creation - narrow type for type checker
+    record_id = result if isinstance(result, int) else result[0]
     return json.dumps({
-        "id": result,
+        "id": record_id,
         "success": True,
-        "url": build_record_url(model, result),
+        "url": build_record_url(model, record_id),
     }, indent=2)
 
 
