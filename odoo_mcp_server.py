@@ -14,7 +14,6 @@ Environment Variables:
 import argparse
 import json
 import os
-from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
@@ -168,11 +167,19 @@ class OdooJsonRpcClient:
 # MCP Server Setup
 # =============================================================================
 
-@asynccontextmanager
-async def get_odoo_client():
-    """依賴注入: 獲取 Odoo 客戶端"""
-    client = OdooJsonRpcClient.connect(ODOO_URL, ODOO_DATABASE, ODOO_API_KEY)
-    yield client
+# 全域共享連線（懶載入單例模式）
+_client: OdooJsonRpcClient | None = None
+
+
+def get_shared_client() -> OdooJsonRpcClient:
+    """取得共享的 Odoo 客戶端（單例模式）
+
+    連線只會在首次呼叫時建立，之後重複使用同一連線。
+    """
+    global _client
+    if _client is None:
+        _client = OdooJsonRpcClient.connect(ODOO_URL, ODOO_DATABASE, ODOO_API_KEY)
+    return _client
 
 
 mcp = FastMCP("Odoo MCP Server (JSON-RPC)", mask_error_details=True)
@@ -183,7 +190,7 @@ mcp = FastMCP("Odoo MCP Server (JSON-RPC)", mask_error_details=True)
 # =============================================================================
 
 @mcp.resource("odoo://models")
-def list_models_resource(client: OdooJsonRpcClient = Depends(get_odoo_client)) -> str:
+def list_models_resource(client: OdooJsonRpcClient = Depends(get_shared_client)) -> str:
     """List all available Odoo models."""
     records = client.search_read(
         "ir.model",
@@ -195,7 +202,7 @@ def list_models_resource(client: OdooJsonRpcClient = Depends(get_odoo_client)) -
 
 
 @mcp.resource("odoo://model/{model_name}")
-def get_model_fields(model_name: str, client: OdooJsonRpcClient = Depends(get_odoo_client)) -> str:
+def get_model_fields(model_name: str, client: OdooJsonRpcClient = Depends(get_shared_client)) -> str:
     """Get field information for a specific model."""
     records = client.search_read(
         "ir.model.fields",
@@ -207,7 +214,7 @@ def get_model_fields(model_name: str, client: OdooJsonRpcClient = Depends(get_od
 
 
 @mcp.resource("odoo://record/{model_name}/{record_id}")
-def get_record(model_name: str, record_id: int, client: OdooJsonRpcClient = Depends(get_odoo_client)) -> str:
+def get_record(model_name: str, record_id: int, client: OdooJsonRpcClient = Depends(get_shared_client)) -> str:
     """Get a single record by ID."""
     records = client.read(model_name, [int(record_id)])
     if records:
@@ -222,7 +229,7 @@ def get_record(model_name: str, record_id: int, client: OdooJsonRpcClient = Depe
 @mcp.tool()
 def list_models(
     name_filter: str | None = None,
-    client: OdooJsonRpcClient = Depends(get_odoo_client),
+    client: OdooJsonRpcClient = Depends(get_shared_client),
 ) -> str:
     """
     List all available Odoo models.
@@ -249,7 +256,7 @@ def list_models(
 def get_fields(
     model: str,
     field_filter: str | None = None,
-    client: OdooJsonRpcClient = Depends(get_odoo_client),
+    client: OdooJsonRpcClient = Depends(get_shared_client),
 ) -> str:
     """
     Get field information for an Odoo model.
@@ -279,7 +286,7 @@ def execute_method(
     method: str,
     args: list | None = None,
     kwargs: dict | None = None,
-    client: OdooJsonRpcClient = Depends(get_odoo_client),
+    client: OdooJsonRpcClient = Depends(get_shared_client),
 ) -> str:
     """
     Execute any method on an Odoo model.
@@ -311,7 +318,7 @@ def search_records(
     limit: int = 100,
     offset: int = 0,
     order: str | None = None,
-    client: OdooJsonRpcClient = Depends(get_odoo_client),
+    client: OdooJsonRpcClient = Depends(get_shared_client),
 ) -> str:
     """
     Search for records in an Odoo model.
@@ -347,7 +354,7 @@ def search_records(
 def count_records(
     model: str,
     domain: list | None = None,
-    client: OdooJsonRpcClient = Depends(get_odoo_client),
+    client: OdooJsonRpcClient = Depends(get_shared_client),
 ) -> str:
     """
     Count records in an Odoo model matching the domain.
@@ -372,7 +379,7 @@ def read_records(
     model: str,
     ids: list[int],
     fields: list[str] | None = None,
-    client: OdooJsonRpcClient = Depends(get_odoo_client),
+    client: OdooJsonRpcClient = Depends(get_shared_client),
 ) -> str:
     """
     Read specific records by their IDs.
@@ -393,7 +400,7 @@ def read_records(
 def create_record(
     model: str,
     values: dict | list[dict],
-    client: OdooJsonRpcClient = Depends(get_odoo_client),
+    client: OdooJsonRpcClient = Depends(get_shared_client),
 ) -> str:
     """
     Create new record(s) in an Odoo model.
@@ -418,7 +425,7 @@ def update_record(
     model: str,
     ids: list[int],
     values: dict,
-    client: OdooJsonRpcClient = Depends(get_odoo_client),
+    client: OdooJsonRpcClient = Depends(get_shared_client),
 ) -> str:
     """
     Update existing records in an Odoo model.
@@ -440,7 +447,7 @@ def update_record(
 def delete_record(
     model: str,
     ids: list[int],
-    client: OdooJsonRpcClient = Depends(get_odoo_client),
+    client: OdooJsonRpcClient = Depends(get_shared_client),
 ) -> str:
     """
     Delete records from an Odoo model.
