@@ -151,11 +151,21 @@ class OdooJsonRpcClient:
         return model_proxy.search_count(domain)
 
     def read(self, model: str, ids: list[int], fields: list[str] | None = None) -> list[dict]:
-        """Read records by IDs."""
+        """Read records by IDs.
+
+        Note: odoolib's read() returns dict for single ID, list for multiple IDs.
+        This method normalizes the result to always return a list.
+        """
         model_proxy = self.get_model(model)
         if fields:
-            return model_proxy.read(ids, fields)
-        return model_proxy.read(ids)
+            result = model_proxy.read(ids, fields)
+        else:
+            result = model_proxy.read(ids)
+
+        # Normalize result: odoolib returns dict for single ID, list for multiple
+        if isinstance(result, dict):
+            return [result]
+        return result
 
     def search_read(
         self,
