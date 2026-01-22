@@ -18,6 +18,7 @@ import sys
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
+from urllib.parse import urlparse
 
 import odoolib
 from dotenv import load_dotenv
@@ -69,7 +70,7 @@ def check_readonly_mode(operation: str) -> None:
 
 def build_record_url(model: str, record_id: int) -> str:
     """Build Odoo record URL for direct browser access."""
-    return f"{ODOO_URL}/odoo/{model}/{record_id}"
+    return f"{ODOO_URL.rstrip('/')}/odoo/{model}/{record_id}"
 
 
 def get_safe_fields(client: "OdooJsonRpcClient", model: str) -> list[str]:
@@ -108,23 +109,17 @@ class OdooJsonRpcClient:
     @classmethod
     def connect(cls, url: str, database: str, api_key: str) -> "OdooJsonRpcClient":
         """Create a new connection to Odoo using JSON-RPC."""
-        # Parse host and port from URL
-        url = url.rstrip("/")
-        if url.startswith("https://"):
-            host = url[8:]
-            protocol = "json2+ssl"
-        elif url.startswith("http://"):
-            host = url[7:]
-            protocol = "json2"
-        else:
-            host = url
-            protocol = "json2"
+        # Parse URL using urlparse for robust handling (IPv6, paths, etc.)
+        parsed = urlparse(url.rstrip("/"))
 
-        # Handle port
-        port = 8069
-        if ":" in host:
-            host, port_str = host.rsplit(":", 1)
-            port = int(port_str)
+        # Determine protocol based on scheme
+        protocol = "json2s" if parsed.scheme == "https" else "json2"
+
+        # Extract host (hostname handles IPv6 correctly)
+        host = parsed.hostname or parsed.netloc
+
+        # Extract port with sensible defaults
+        port = parsed.port or (443 if protocol == "json2s" else 8069)
 
         connection = odoolib.get_connection(
             hostname=host,
