@@ -668,19 +668,34 @@ def update_record(
 def delete_record(
     model: str,
     ids: list[int],
+    confirm: bool = False,
     client: OdooJsonRpcClient = Depends(get_shared_client),
 ) -> str:
     """
-    Delete records from an Odoo model.
+    Delete records from an Odoo model. IRREVERSIBLE operation.
+
+    IMPORTANT: You MUST first call with confirm=False to show the user what will be deleted.
+    Only set confirm=True AFTER the user explicitly approves the deletion.
+    NEVER set confirm=True on the first call.
 
     Args:
         model: Model name (e.g., 'res.partner')
         ids: List of record IDs to delete
+        confirm: Safety flag. Always call with False first, then True only after user approval.
 
     Returns:
-        JSON string with success status
+        JSON string with success status or pending confirmation
     """
     check_readonly_mode("unlink")
+    if not confirm:
+        return json.dumps({
+            "status": "error",
+            "error": f"Deletion not confirmed. You must ask the user to confirm "
+            f"before deleting {len(ids)} record(s) from {model}. "
+            f"Set confirm=True only after user approval.",
+            "details": {"model": model, "ids": ids},
+            "warning": "This action is IRREVERSIBLE.",
+        }, ensure_ascii=False, indent=2)
     result = client.unlink(model, ids)
     return json.dumps({"success": result, "deleted_ids": ids}, indent=2)
 

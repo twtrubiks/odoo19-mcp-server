@@ -241,7 +241,7 @@ claude mcp add --transport http odoo-mcp https://your-cloud-server.com:8000/mcp
 | `read_records` | 讀取指定 ID 記錄 | Yes |
 | `create_record` | 建立記錄 | No |
 | `update_record` | 更新記錄 | No |
-| `delete_record` | 刪除記錄 | No |
+| `delete_record` | 刪除記錄（需二次確認） | No |
 | `execute_method` | 執行模型方法 | Depends |
 
 ## Claude Code MCP 設定
@@ -418,9 +418,15 @@ gemini mcp add --scope user odoo-mcp docker -- run -i --rm --add-host=host.docke
 
 </details>
 
-## 唯讀模式
+## 安全機制
+
+### 唯讀模式
 
 設定 `READONLY_MODE=true` 可禁止所有寫入操作（create、write、unlink、copy），適用於生產環境查詢。
+
+### 刪除二次確認
+
+`delete_record` 內建 confirm 機制，LLM 必須先以 `confirm=False` 呼叫取得確認提示，經使用者同意後才能以 `confirm=True` 執行刪除。
 
 ## License
 
