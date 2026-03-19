@@ -604,7 +604,7 @@ def read_records(
     return json.dumps(records, indent=2, ensure_ascii=False, default=format_datetime)
 
 
-@mcp.tool()
+@mcp.tool(tags={"write"})
 def create_record(
     model: str,
     values: dict | list[dict],
@@ -625,9 +625,8 @@ def create_record(
         The 'url' field provides direct browser access to the created record(s).
 
     Note:
-        In READONLY_MODE, this operation is blocked.
+        In READONLY_MODE, this tool is hidden from LLM via tags.
     """
-    check_readonly_mode("create")
     result = client.create(model, values)
     if isinstance(values, list):
         ids = result if isinstance(result, list) else [result]
@@ -652,7 +651,7 @@ def create_record(
     )
 
 
-@mcp.tool(annotations={"idempotentHint": True})
+@mcp.tool(tags={"write"}, annotations={"idempotentHint": True})
 def update_record(
     model: str,
     ids: list[int],
@@ -675,9 +674,8 @@ def update_record(
         - error: Error message (only if success=False)
 
     Note:
-        In READONLY_MODE, this operation is blocked.
+        In READONLY_MODE, this tool is hidden from LLM via tags.
     """
-    check_readonly_mode("write")
     result = client.write(model, ids, values)
 
     if result:
@@ -700,7 +698,7 @@ def update_record(
         )
 
 
-@mcp.tool(annotations={"destructiveHint": True, "idempotentHint": True})
+@mcp.tool(tags={"write", "destructive"}, annotations={"destructiveHint": True, "idempotentHint": True})
 def delete_record(
     model: str,
     ids: list[int],
@@ -722,7 +720,6 @@ def delete_record(
     Returns:
         JSON string with success status or pending confirmation
     """
-    check_readonly_mode("unlink")
     if not confirm:
         return json.dumps(
             {
@@ -757,7 +754,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if READONLY_MODE:
-        print("⚠️  READONLY_MODE is enabled. Write operations are disabled.", file=sys.stderr)
+        mcp.disable(tags={"write"})
+        print("⚠️  READONLY_MODE is enabled. Write tools are hidden.", file=sys.stderr)
 
     if args.transport == "stdio":
         mcp.run()

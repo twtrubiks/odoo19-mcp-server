@@ -422,7 +422,10 @@ gemini mcp add --scope user odoo-mcp docker -- run -i --rm --add-host=host.docke
 
 ### 唯讀模式
 
-設定 `READONLY_MODE=true` 可禁止所有寫入操作（create、write、unlink、copy），適用於生產環境查詢。
+設定 `READONLY_MODE=true` 啟用唯讀模式，適用於生產環境查詢：
+
+- 寫入工具（`create_record`、`update_record`、`delete_record`）透過 FastMCP tags 直接隱藏，LLM 不會看到這些工具
+- `execute_method` 仍可見，但呼叫寫入方法（create、write、unlink、copy）時會被 runtime 攔截
 
 ### 刪除二次確認
 
