@@ -11,8 +11,8 @@ Odoo 19 MCP Server，使用 JSON-2 API 連線。
 ## 技術棧
 
 - **Python**: 3.13
-- **FastMCP**: 2.14.3
-- **odoo-client-lib**: 2.0.0 (JSON-2 API)
+- **FastMCP**: >=3.0.0,<4.0.0
+- **odoo-client-lib**: 2.0.1 (JSON-2 API)
 
 ## 架構
 

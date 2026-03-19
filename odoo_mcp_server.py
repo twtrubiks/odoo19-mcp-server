@@ -35,7 +35,7 @@ load_dotenv()
 # Configuration
 # =============================================================================
 
-ODOO_URL = os.getenv("ODOO_URL", "http://localhost:8019")
+ODOO_URL = os.getenv("ODOO_URL", "http://localhost:8069")
 ODOO_DATABASE = os.getenv("ODOO_DATABASE", "your_database_key_here")
 ODOO_API_KEY = os.getenv("ODOO_API_KEY", "your_api_key_here")
 READONLY_MODE = os.getenv("READONLY_MODE", "false").lower() == "true"
