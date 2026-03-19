@@ -120,7 +120,7 @@ pip install -r requirements.txt
 ### 開發模式（MCP Inspector）
 
 ```bash
-fastmcp dev odoo_mcp_server.py
+fastmcp dev inspector odoo_mcp_server.py
 ```
 
 ## 傳輸模式（Transport）
