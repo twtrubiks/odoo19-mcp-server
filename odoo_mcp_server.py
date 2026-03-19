@@ -11,6 +11,8 @@ Environment Variables:
     READONLY_MODE: Set to "true" to disable write operations (default: false)
 """
 
+__version__ = "1.0.0"
+
 import argparse
 import json
 import os
@@ -25,6 +27,7 @@ from dotenv import load_dotenv
 from fastmcp import FastMCP
 from fastmcp.dependencies import Depends
 from fastmcp.exceptions import ToolError
+from starlette.responses import JSONResponse
 
 load_dotenv()
 
@@ -251,6 +254,17 @@ def get_shared_client() -> OdooJsonRpcClient:
 
 
 mcp = FastMCP("Odoo MCP Server (JSON-RPC)", mask_error_details=True)
+
+
+# =============================================================================
+# Custom Routes
+# =============================================================================
+
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health_check(request):
+    """Health check endpoint for load balancers and monitoring."""
+    return JSONResponse({"status": "healthy", "service": "odoo-mcp-server", "version": __version__})
 
 
 # =============================================================================

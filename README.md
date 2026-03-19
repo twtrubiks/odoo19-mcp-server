@@ -428,6 +428,17 @@ gemini mcp add --scope user odoo-mcp docker -- run -i --rm --add-host=host.docke
 
 `delete_record` 內建 confirm 機制，LLM 必須先以 `confirm=False` 呼叫取得確認提示，經使用者同意後才能以 `confirm=True` 執行刪除。
 
+## 健康檢查
+
+HTTP/SSE transport 模式下提供 `/health` 端點：
+
+```bash
+curl http://localhost:8000/health
+# {"status": "healthy", "service": "odoo-mcp-server", "version": "1.0.0"}
+```
+
+適用於 Docker healthcheck、Kubernetes probe、load balancer 探活。stdio 模式下不影響。
+
 ## License
 
 Apache 2.0
