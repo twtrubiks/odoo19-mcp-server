@@ -100,6 +100,7 @@ def get_safe_fields(client: "OdooJsonRpcClient", model: str) -> list[str]:
 # Odoo JSON-RPC Client
 # =============================================================================
 
+
 @dataclass
 class OdooJsonRpcClient:
     """Wrapper for odoolib connection using JSON-RPC (json2) protocol."""
@@ -152,10 +153,7 @@ class OdooJsonRpcClient:
         This method normalizes the result to always return a list.
         """
         model_proxy = self.get_model(model)
-        if fields:
-            result = model_proxy.read(ids, fields)
-        else:
-            result = model_proxy.read(ids)
+        result = model_proxy.read(ids, fields) if fields else model_proxy.read(ids)
 
         # Normalize result: odoolib returns dict for single ID, list for multiple
         if isinstance(result, dict):
@@ -259,6 +257,7 @@ mcp = FastMCP("Odoo MCP Server (JSON-RPC)", mask_error_details=True)
 # Resources
 # =============================================================================
 
+
 @mcp.resource("odoo://models")
 def list_models_resource(client: OdooJsonRpcClient = Depends(get_shared_client)) -> str:
     """List all available Odoo models."""
@@ -277,8 +276,18 @@ def get_model_fields(model_name: str, client: OdooJsonRpcClient = Depends(get_sh
     # 使用 fields_get() 取得更完整的欄位資訊
     fields_data = client.fields_get(
         model_name,
-        attributes=["type", "string", "help", "required", "readonly", "store",
-                   "selection", "comodel_name", "inverse_name", "domain"],
+        attributes=[
+            "type",
+            "string",
+            "help",
+            "required",
+            "readonly",
+            "store",
+            "selection",
+            "comodel_name",
+            "inverse_name",
+            "domain",
+        ],
     )
 
     # 轉換為列表格式
@@ -345,6 +354,7 @@ def get_current_company(client: OdooJsonRpcClient = Depends(get_shared_client)) 
 # Tools
 # =============================================================================
 
+
 @mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True})
 def list_models(
     name_filter: str | None = None,
@@ -379,10 +389,10 @@ DEFAULT_FIELD_ATTRIBUTES = [
     "required",
     "readonly",
     "store",
-    "selection",      # Selection 欄位的選項
-    "comodel_name",   # Many2one/One2many/Many2many 關聯模型
-    "inverse_name",   # One2many 反向欄位
-    "domain",         # 關聯欄位的 domain
+    "selection",  # Selection 欄位的選項
+    "comodel_name",  # Many2one/One2many/Many2many 關聯模型
+    "inverse_name",  # One2many 反向欄位
+    "domain",  # 關聯欄位的 domain
 ]
 
 
@@ -607,19 +617,25 @@ def create_record(
     result = client.create(model, values)
     if isinstance(values, list):
         ids = result if isinstance(result, list) else [result]
-        return json.dumps({
-            "ids": ids,
-            "count": len(ids),
-            "success": True,
-            "urls": [build_record_url(model, id) for id in ids],
-        }, indent=2)
+        return json.dumps(
+            {
+                "ids": ids,
+                "count": len(ids),
+                "success": True,
+                "urls": [build_record_url(model, id) for id in ids],
+            },
+            indent=2,
+        )
     # Single record creation - narrow type for type checker
     record_id = result if isinstance(result, int) else result[0]
-    return json.dumps({
-        "id": record_id,
-        "success": True,
-        "url": build_record_url(model, record_id),
-    }, indent=2)
+    return json.dumps(
+        {
+            "id": record_id,
+            "success": True,
+            "url": build_record_url(model, record_id),
+        },
+        indent=2,
+    )
 
 
 @mcp.tool(annotations={"idempotentHint": True})
@@ -651,17 +667,23 @@ def update_record(
     result = client.write(model, ids, values)
 
     if result:
-        return json.dumps({
-            "success": True,
-            "updated_ids": ids,
-            "urls": [build_record_url(model, id) for id in ids],
-        }, indent=2)
+        return json.dumps(
+            {
+                "success": True,
+                "updated_ids": ids,
+                "urls": [build_record_url(model, id) for id in ids],
+            },
+            indent=2,
+        )
     else:
-        return json.dumps({
-            "success": False,
-            "updated_ids": ids,
-            "error": "Update operation failed",
-        }, indent=2)
+        return json.dumps(
+            {
+                "success": False,
+                "updated_ids": ids,
+                "error": "Update operation failed",
+            },
+            indent=2,
+        )
 
 
 @mcp.tool(annotations={"destructiveHint": True, "idempotentHint": True})
@@ -688,14 +710,18 @@ def delete_record(
     """
     check_readonly_mode("unlink")
     if not confirm:
-        return json.dumps({
-            "status": "error",
-            "error": f"Deletion not confirmed. You must ask the user to confirm "
-            f"before deleting {len(ids)} record(s) from {model}. "
-            f"Set confirm=True only after user approval.",
-            "details": {"model": model, "ids": ids},
-            "warning": "This action is IRREVERSIBLE.",
-        }, ensure_ascii=False, indent=2)
+        return json.dumps(
+            {
+                "status": "error",
+                "error": f"Deletion not confirmed. You must ask the user to confirm "
+                f"before deleting {len(ids)} record(s) from {model}. "
+                f"Set confirm=True only after user approval.",
+                "details": {"model": model, "ids": ids},
+                "warning": "This action is IRREVERSIBLE.",
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
     result = client.unlink(model, ids)
     return json.dumps({"success": result, "deleted_ids": ids}, indent=2)
 
