@@ -462,7 +462,7 @@ def get_fields(
     return json.dumps(result, indent=2, ensure_ascii=False)
 
 
-@mcp.tool()
+@mcp.tool(tags={"write"})
 def execute_method(
     model: str,
     method: str,
