@@ -6,7 +6,15 @@ from unittest.mock import MagicMock, patch
 import pytest
 from fastmcp.exceptions import ToolError
 
-from odoo_mcp_server import OdooJsonRpcClient, create_record, delete_record, execute_method
+from odoo_mcp_server import (
+    OdooJsonRpcClient,
+    _sanitize_error_message,
+    create_record,
+    delete_record,
+    execute_method,
+    handle_tool_errors,
+    search_records,
+)
 
 # =============================================================================
 # 1. connect() URL 解析 — 分支多，使用者輸入格式千變萬化
@@ -211,3 +219,131 @@ class TestExecuteMethodReadonly:
         result = json.loads(execute_method(model="res.partner", method="search", args=[[]], client=mock_client))
         assert result == [1, 2, 3]
         mock_client.execute.assert_called_once()
+
+
+# =============================================================================
+# 6. handle_tool_errors — 統一錯誤處理 decorator
+# =============================================================================
+
+
+class TestHandleToolErrors:
+    """測試 handle_tool_errors decorator 的錯誤轉換邏輯."""
+
+    def test_normal_return_passes_through(self):
+        """正常回傳值不受影響."""
+
+        @handle_tool_errors
+        def good_func():
+            return "ok"
+
+        assert good_func() == "ok"
+
+    def test_generic_exception_converted_to_tool_error(self):
+        """一般 Exception → 轉為 ToolError，保留原始訊息."""
+
+        @handle_tool_errors
+        def bad_func():
+            raise RuntimeError("model not found")
+
+        with pytest.raises(ToolError, match="bad_func failed: model not found"):
+            bad_func()
+
+    def test_tool_error_not_wrapped(self):
+        """已經是 ToolError → 直接 re-raise，不會被包兩層."""
+
+        @handle_tool_errors
+        def readonly_func():
+            raise ToolError("not allowed in READONLY_MODE")
+
+        with pytest.raises(ToolError, match="not allowed in READONLY_MODE"):
+            readonly_func()
+
+    def test_original_exception_chained(self):
+        """原始 Exception 應保留在 __cause__ 中."""
+
+        @handle_tool_errors
+        def failing_func():
+            raise ValueError("bad value")
+
+        with pytest.raises(ToolError) as exc_info:
+            failing_func()
+        assert isinstance(exc_info.value.__cause__, ValueError)
+
+    def test_search_records_rpc_error(self):
+        """實際 tool：search_records RPC 錯誤 → ToolError."""
+        mock_client = MagicMock()
+        mock_client.search_read.side_effect = Exception("Object res.partnerr doesn't exist")
+
+        with pytest.raises(ToolError, match="search_records failed.*doesn't exist"):
+            search_records(model="res.partnerr", client=mock_client)
+
+    def test_execute_method_rpc_error(self):
+        """實際 tool：execute_method RPC 錯誤 → ToolError."""
+        mock_client = MagicMock()
+        mock_client.execute.side_effect = ConnectionError("Connection refused")
+
+        with pytest.raises(ToolError, match="execute_method failed.*Connection refused"):
+            execute_method(model="res.partner", method="search", args=[[]], client=mock_client)
+
+
+# =============================================================================
+# 7. _sanitize_error_message — 去除 Odoo debug traceback
+# =============================================================================
+
+
+class TestSanitizeErrorMessage:
+    """測試 _sanitize_error_message 的 debug 欄位移除邏輯."""
+
+    def test_strips_debug_from_odoo_rpc_error(self):
+        """Odoo RPC 錯誤 → 移除 debug 欄位，保留其他資訊."""
+        body = {
+            "name": "werkzeug.exceptions.NotFound",
+            "message": "the model 'res.partnersa' does not exist",
+            "arguments": ["the model 'res.partnersa' does not exist", 404],
+            "context": {},
+            "debug": "Traceback (most recent call last):\n  File ...\n  ...",
+        }
+        error = Exception(f"Unexpected status code 404: {json.dumps(body)}")
+        result = _sanitize_error_message(error)
+
+        assert "debug" not in result
+        assert "Traceback" not in result
+        assert "the model 'res.partnersa' does not exist" in result
+        assert "Unexpected status code 404:" in result
+        assert "werkzeug.exceptions.NotFound" in result
+
+    def test_no_debug_field_unchanged(self):
+        """JSON body 沒有 debug 欄位 → 原樣回傳."""
+        body = {"name": "SomeError", "message": "something went wrong"}
+        error = Exception(f"Status 500: {json.dumps(body)}")
+        result = _sanitize_error_message(error)
+        assert result == str(error)
+
+    def test_plain_exception_unchanged(self):
+        """非 JSON 的一般 Exception → 原樣回傳."""
+        error = ConnectionError("Connection refused")
+        result = _sanitize_error_message(error)
+        assert result == "Connection refused"
+
+    def test_non_dict_json_unchanged(self):
+        """JSON 是 array 而非 dict → 原樣回傳."""
+        error = Exception("Some prefix: [1, 2, 3]")
+        result = _sanitize_error_message(error)
+        assert result == str(error)
+
+    def test_integration_with_decorator(self):
+        """decorator 整合測試：Odoo 風格錯誤經過 decorator 後 debug 被移除."""
+        body = {
+            "message": "field 'namee' does not exist",
+            "debug": "Traceback ...\n  very long traceback ...",
+        }
+
+        @handle_tool_errors
+        def failing_tool():
+            raise Exception(f"Unexpected status code 400: {json.dumps(body)}")
+
+        with pytest.raises(ToolError) as exc_info:
+            failing_tool()
+        error_msg = str(exc_info.value)
+        assert "field 'namee' does not exist" in error_msg
+        assert "Traceback" not in error_msg

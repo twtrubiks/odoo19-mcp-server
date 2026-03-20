@@ -14,6 +14,7 @@ Environment Variables:
 __version__ = "1.0.0"
 
 import argparse
+import functools
 import json
 import os
 import sys
@@ -69,6 +70,47 @@ def check_readonly_mode(operation: str) -> None:
             f"Operation '{operation}' is not allowed in READONLY_MODE. "
             "Set READONLY_MODE=false to enable write operations."
         )
+
+
+def _sanitize_error_message(error: Exception) -> str:
+    """Remove debug traceback from Odoo JSON-RPC error messages.
+
+    Odoo errors often contain a JSON body with a "debug" field holding
+    the full server-side traceback. This strips that field to reduce
+    token usage and avoid leaking internal server paths.
+    """
+    msg = str(error)
+    try:
+        # Odoo RPC errors look like: "Unexpected status code 404: {json_body}"
+        json_start = msg.index("{")
+        prefix = msg[:json_start]
+        body = json.loads(msg[json_start:])
+        if isinstance(body, dict) and "debug" in body:
+            body.pop("debug")
+            return prefix + json.dumps(body, ensure_ascii=False)
+    except (ValueError, json.JSONDecodeError):
+        pass
+    return msg
+
+
+def handle_tool_errors(func):
+    """Decorator to convert unhandled exceptions to ToolError.
+
+    Ensures error messages pass through mask_error_details to the LLM,
+    instead of being masked as generic "Internal error".
+    """
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except ToolError:
+            raise
+        except Exception as e:
+            sanitized = _sanitize_error_message(e)
+            raise ToolError(f"{func.__name__} failed: {sanitized}") from e
+
+    return wrapper
 
 
 def build_record_url(model: str, record_id: int) -> str:
@@ -370,6 +412,7 @@ def get_current_company(client: OdooJsonRpcClient = Depends(get_shared_client)) 
 
 
 @mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True})
+@handle_tool_errors
 def list_models(
     name_filter: str | None = None,
     client: OdooJsonRpcClient = Depends(get_shared_client),
@@ -411,6 +454,7 @@ DEFAULT_FIELD_ATTRIBUTES = [
 
 
 @mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True})
+@handle_tool_errors
 def get_fields(
     model: str,
     field_filter: str | None = None,
@@ -463,6 +507,7 @@ def get_fields(
 
 
 @mcp.tool(tags={"write"})
+@handle_tool_errors
 def execute_method(
     model: str,
     method: str,
@@ -493,6 +538,7 @@ def execute_method(
 
 
 @mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True})
+@handle_tool_errors
 def search_records(
     model: str,
     domain: list | None = None,
@@ -546,6 +592,7 @@ def search_records(
 
 
 @mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True})
+@handle_tool_errors
 def count_records(
     model: str,
     domain: list | None = None,
@@ -572,6 +619,7 @@ def count_records(
 
 
 @mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True})
+@handle_tool_errors
 def read_records(
     model: str,
     ids: list[int],
@@ -605,6 +653,7 @@ def read_records(
 
 
 @mcp.tool(tags={"write"})
+@handle_tool_errors
 def create_record(
     model: str,
     values: dict | list[dict],
@@ -652,6 +701,7 @@ def create_record(
 
 
 @mcp.tool(tags={"write"}, annotations={"idempotentHint": True})
+@handle_tool_errors
 def update_record(
     model: str,
     ids: list[int],
@@ -699,6 +749,7 @@ def update_record(
 
 
 @mcp.tool(tags={"write", "destructive"}, annotations={"destructiveHint": True, "idempotentHint": True})
+@handle_tool_errors
 def delete_record(
     model: str,
     ids: list[int],
