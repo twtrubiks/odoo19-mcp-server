@@ -1,5 +1,13 @@
 # Odoo 19 MCP Server (JSON-2 API)
 
+[![odoo19-mcp-server MCP server](https://glama.ai/mcp/servers/twtrubiks/odoo19-mcp-server/badges/card.svg)](https://glama.ai/mcp/servers/twtrubiks/odoo19-mcp-server)
+
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.13-blue?logo=python&logoColor=white)](https://www.python.org/)
+[![GitHub stars](https://img.shields.io/github/stars/twtrubiks/odoo19-mcp-server?style=flat)](https://github.com/twtrubiks/odoo19-mcp-server/stargazers)
+[![GitHub last commit](https://img.shields.io/github/last-commit/twtrubiks/odoo19-mcp-server)](https://github.com/twtrubiks/odoo19-mcp-server/commits/main)
+[![Awesome MCP Servers](https://img.shields.io/badge/Awesome-MCP_Servers-fc60a8?logo=awesomelists&logoColor=white)](https://github.com/punkpeye/awesome-mcp-servers)
+
 * [Youtube Tutorial - MCP Server 自己做！Odoo 19 + FastMCP 完整開發教學](https://youtu.be/JhAudIIII3M)
 
 Odoo 19 MCP Server，使用 JSON-2 API 連線。
