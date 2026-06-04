@@ -426,6 +426,73 @@ gemini mcp add --scope user odoo-mcp docker -- run -i --rm --add-host=host.docke
 
 </details>
 
+## Antigravity CLI MCP 設定
+
+> 自 2026/6/18 起個人版 Gemini CLI 停止服務，改用 [Antigravity CLI](https://antigravity.google/)。目前 **沒有** `mcp add` 子指令，需手動編輯設定檔。
+
+設定檔路徑為 `~/.gemini/config/mcp_config.json`（Antigravity CLI / IDE / SDK 共用，等同 Gemini CLI 的 `--scope user`）。
+
+JSON 格式與上方 Gemini MCP 設定相同.
+
+設定後進入 Antigravity CLI 以 `/mcp` 指令重新載入，並確認連線狀態。
+
+## OpenClaw MCP 設定
+
+OpenClaw 透過 CLI 管理 MCP server，設定會寫入 `mcp.servers.<name>`。
+
+> `/mcp` 指令為 **owner-only 且預設關閉**，需以 `commands.mcp: true` 開啟才能在 chat session 中使用。
+
+### 步驟 1：註冊 MCP server
+
+```sh
+openclaw mcp set <name> '<JSON>'
+
+# 範例（請將 your-server-ip 換成你的 MCP server 位址）：
+openclaw mcp set odoo-mcp '{"type":"http","url":"http://your-server-ip:8000/mcp"}'
+```
+
+OpenClaw 會自動正規化設定，把 `type:"http"` 轉成 `transport:"streamable-http"` 後存入：
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "odoo-mcp": {
+        "url": "http://your-server-ip:8000/mcp",
+        "transport": "streamable-http"
+      }
+    }
+  }
+}
+```
+
+### 步驟 2：開啟 `/mcp` 指令
+
+```sh
+openclaw config set commands.mcp true
+```
+
+### 步驟 3：重啟 Gateway 套用設定
+
+```sh
+openclaw gateway restart
+```
+
+> 若想等進行中的工作排空再重啟，可改用 `openclaw gateway restart --safe`。
+
+### 驗證
+
+```sh
+# server 是否註冊成功
+openclaw mcp list
+openclaw mcp show odoo-mcp
+
+# /mcp 開關狀態（應回傳 true）
+openclaw config get commands.mcp
+```
+
+完成後請**開一個新的 chat session（或硬重整 dashboard），再輸入 `/mcp`** 確認 `odoo-mcp` 連線狀態。
+
 ## 安全機制
 
 ### 唯讀模式
