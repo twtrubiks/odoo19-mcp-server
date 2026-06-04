@@ -297,7 +297,15 @@ def get_shared_client() -> OdooJsonRpcClient:
     return _client
 
 
-mcp = FastMCP("Odoo MCP Server (JSON-RPC)", mask_error_details=True)
+mcp = FastMCP(
+    "Odoo MCP Server (JSON-RPC)",
+    mask_error_details=True,
+    instructions=(
+        "你只能操作 Odoo ERP 系統中的資料（銷售、財務、庫存、聯絡人等）。"
+        "如果使用者的需求不在工具能力範圍內，請直接告知無法處理，不要反覆嘗試。"
+        "不支援：系統管理、模組安裝、使用者權限管理、SQL 查詢、非 Odoo 相關任務。"
+    ),
+)
 
 
 # =============================================================================
