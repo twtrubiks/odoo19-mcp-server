@@ -14,12 +14,14 @@ Environment Variables:
 __version__ = "1.0.0"
 
 import argparse
+import base64
 import functools
 import json
 import os
 import sys
 from dataclasses import dataclass
 from datetime import date, datetime
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -786,6 +788,93 @@ def delete_record(
         )
     result = client.unlink(model, ids)
     return json.dumps({"success": result, "deleted_ids": ids}, indent=2)
+
+
+@mcp.tool(tags={"write"})
+@handle_tool_errors
+def add_attachment(
+    file_path: str | None = None,
+    base64_data: str | None = None,
+    file_name: str | None = None,
+    res_model: str | None = None,
+    res_id: int | None = None,
+    description: str | None = None,
+    client: OdooJsonRpcClient = Depends(get_shared_client),
+) -> str:
+    """
+    Upload a file attachment to Odoo via ir.attachment.
+
+    Supports two input modes:
+    - file_path: Read a local file from the MCP server's filesystem.
+    - base64_data + file_name: Pass file content directly as base64 string.
+      Use this when the file is not on disk (e.g., image uploaded via Discord).
+
+    Args:
+        file_path: Absolute path to a local file (e.g., '/tmp/invoice.png').
+                   Mutually exclusive with base64_data.
+        base64_data: File content as a base64-encoded string.
+                     Mutually exclusive with file_path.
+        file_name: Filename for the attachment (e.g., 'invoice.png').
+                   Required when using base64_data. Ignored when file_path is provided.
+        res_model: Model to attach to (e.g., 'account.move'). None for standalone attachment.
+        res_id: Record ID to attach to. Required if res_model is provided.
+        description: Optional description for the attachment.
+
+    Returns:
+        JSON string with attachment ID, URL, and linked record info.
+
+    Note:
+        In READONLY_MODE, this tool is hidden from LLM via tags.
+    """
+    if file_path and base64_data:
+        raise ToolError("Provide either 'file_path' or 'base64_data', not both.")
+    if not file_path and not base64_data:
+        raise ToolError("Either 'file_path' or 'base64_data' must be provided.")
+
+    if file_path:
+        path = Path(file_path)
+        if not path.is_file():
+            raise ToolError(f"File not found: {file_path}")
+        file_data = base64.b64encode(path.read_bytes()).decode("ascii")
+        name = path.name
+        file_size = path.stat().st_size
+    else:
+        if not file_name:
+            raise ToolError("'file_name' is required when using 'base64_data'.")
+        file_data = base64_data  # type: ignore[assignment]
+        name = file_name
+        file_size = len(base64.b64decode(base64_data))  # type: ignore[arg-type]
+
+    values: dict[str, Any] = {
+        "name": name,
+        "datas": file_data,
+    }
+    if res_model:
+        values["res_model"] = res_model
+        if res_id:
+            values["res_id"] = res_id
+    if description:
+        values["description"] = description
+
+    attachment_id = client.create("ir.attachment", values)
+    if isinstance(attachment_id, list):
+        attachment_id = attachment_id[0]
+
+    result: dict[str, Any] = {
+        "id": attachment_id,
+        "success": True,
+        "file_name": name,
+        "file_size": file_size,
+        "url": build_record_url("ir.attachment", attachment_id),
+    }
+    if res_model and res_id:
+        result["linked_to"] = {
+            "model": res_model,
+            "id": res_id,
+            "url": build_record_url(res_model, res_id),
+        }
+
+    return json.dumps(result, indent=2)
 
 
 # =============================================================================
