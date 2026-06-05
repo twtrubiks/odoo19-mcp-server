@@ -18,7 +18,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY odoo_mcp_server.py .
 
 # 建立非 root 用戶
-RUN useradd --create-home appuser
+RUN useradd --create-home appuser \
+    && mkdir -p /shared/uploads \
+    && chown -R appuser:appuser /shared
 USER appuser
 
 # 環境變數（執行時透過 -e 覆蓋）

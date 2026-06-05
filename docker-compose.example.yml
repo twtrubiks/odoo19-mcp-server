@@ -1,0 +1,31 @@
+# Odoo MCP Server - Docker Compose 範本
+#
+# 使用方式：
+#   cp .env.example .env                              # 填入 ODOO_URL / ODOO_DATABASE / ODOO_API_KEY
+#   cp docker-compose.example.yml docker-compose.yml  # 依需求調整
+#   docker compose up -d
+#
+# 注意：此範本「不是」up 完即可運作的完整堆疊。
+# 圖片 / 附件傳遞流程需要「另一端」（MCP client + 上傳圖片的服務），
+# 它必須掛載同一個 shared-uploads volume，並連線 http://odoo-mcp:8000/mcp。
+# 見下方註解掉的 your-client 服務。
+
+volumes:
+  shared-uploads:
+
+services:
+  odoo-mcp:
+    build: .
+    command: ["python", "odoo_mcp_server.py", "--transport", "http", "--host", "0.0.0.0", "--port", "8000"]
+    # 對外暴露 port 8000（host 端 client 可直接連 http://localhost:8000/mcp）。
+    # 若只需 Docker 內網存取（例如 client 也在同一個 compose 裡），可整段移除 ports。
+    ports:
+      - "8000:8000"
+    environment:
+      - ODOO_URL=${ODOO_URL}
+      - ODOO_DATABASE=${ODOO_DATABASE}
+      - ODOO_API_KEY=${ODOO_API_KEY}
+      - READONLY_MODE=${READONLY_MODE:-false}
+    volumes:
+      - shared-uploads:/shared # 圖片傳遞通道；對應 Dockerfile 預建的 /shared/uploads
+    restart: unless-stopped

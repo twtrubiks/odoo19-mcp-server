@@ -190,23 +190,39 @@ python odoo_mcp_server.py --transport sse --host 0.0.0.0 --port 8000
 
 ### 雲端部署（HTTP 模式）
 
-Docker Compose 範例：
+專案提供 `docker-compose.example.yml` 範本，複製後修改即可使用：
+
+```bash
+cp .env.example .env                                  # 填入 ODOO_URL / ODOO_DATABASE / ODOO_API_KEY
+cp docker-compose.example.yml docker-compose.yml      # 依需求調整
+docker compose up -d
+```
+
+範本內容
 
 ```yaml
+volumes:
+  shared-uploads:
+
 services:
   odoo-mcp:
     build: .
+    command: ["python", "odoo_mcp_server.py", "--transport", "http", "--host", "0.0.0.0", "--port", "8000"]
+    # 對外暴露 port 8000（host 端 client 可直接連 http://localhost:8000/mcp）。
+    # 若只需 Docker 內網存取（例如 client 也在同一個 compose 裡），可整段移除 ports。
     ports:
       - "8000:8000"
     environment:
-      - ODOO_URL=http://odoo:8069
-      - ODOO_DATABASE=odoo19
-      - ODOO_API_KEY=your_api_key_here
-    command: ["python", "odoo_mcp_server.py", "--transport", "http", "--host", "0.0.0.0", "--port", "8000"]
+      - ODOO_URL=${ODOO_URL}
+      - ODOO_DATABASE=${ODOO_DATABASE}
+      - ODOO_API_KEY=${ODOO_API_KEY}
+      - READONLY_MODE=${READONLY_MODE:-false}
+    volumes:
+      - shared-uploads:/shared   # 圖片傳遞通道；對應 Dockerfile 預建的 /shared/uploads
     restart: unless-stopped
 ```
 
-Client 設定(claude)改用 URL 連線：
+> **圖片 / 附件傳遞**：`add_attachment` 的 `file_path` 模式會從 `/shared/uploads/` 讀檔上傳到 Odoo，避免大量 base64 佔用 LLM output token。
 
 ```sh
 claude mcp add --transport http odoo-mcp https://your-cloud-server.com:8000/mcp
