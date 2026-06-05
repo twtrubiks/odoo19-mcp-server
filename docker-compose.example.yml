@@ -9,6 +9,14 @@
 # 圖片 / 附件傳遞流程需要「另一端」（MCP client + 上傳圖片的服務），
 # 它必須掛載同一個 shared-uploads volume，並連線 http://odoo-mcp:8000/mcp。
 # 見下方註解掉的 your-client 服務。
+#
+# 重要前提：shared-uploads 是 Docker named volume，只能在「同一台 Docker host」
+# 的容器之間共享。唯有 client 與 odoo-mcp 同主機（例如同一個 compose）時，
+# client 才能把檔案寫進 volume，讓 server 用 add_attachment 的 file_path 模式
+# （路徑在 /shared/uploads/...）讀取。
+# 若 client 在「另一台機器」透過網路呼叫遠端 server，雙方無法共用此 volume，
+# 只能改用 add_attachment 的 base64_data 模式傳檔（base64 體積膨脹約 33%，
+# 不適合過大的檔案）。
 
 volumes:
   shared-uploads:

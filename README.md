@@ -8,6 +8,14 @@
 [![GitHub last commit](https://img.shields.io/github/last-commit/twtrubiks/odoo19-mcp-server)](https://github.com/twtrubiks/odoo19-mcp-server/commits/main)
 [![Awesome MCP Servers](https://img.shields.io/badge/Awesome-MCP_Servers-fc60a8?logo=awesomelists&logoColor=white)](https://github.com/punkpeye/awesome-mcp-servers)
 
+**支援的 MCP Client**
+
+[![Claude Code](https://img.shields.io/badge/Claude_Code-supported-D97757?logo=anthropic&logoColor=white)](#claude-code)
+[![Gemini CLI](https://img.shields.io/badge/Gemini_CLI-supported-4285F4?logo=googlegemini&logoColor=white)](#gemini-cli)
+[![Antigravity CLI](https://img.shields.io/badge/Antigravity_CLI-supported-1A73E8?logo=google&logoColor=white)](#antigravity-cli)
+[![OpenClaw](https://img.shields.io/badge/OpenClaw-supported-7C3AED)](#openclaw)
+[![Codex CLI](https://img.shields.io/badge/Codex_CLI-supported-000000?logo=openai&logoColor=white)](#codex-cli)
+
 * [Youtube Tutorial - MCP Server 自己做！Odoo 19 + FastMCP 完整開發教學](https://youtu.be/JhAudIIII3M)
 
 Odoo 19 MCP Server，使用 JSON-2 API 連線。
@@ -223,6 +231,8 @@ services:
 ```
 
 > **圖片 / 附件傳遞**：`add_attachment` 的 `file_path` 模式會從 `/shared/uploads/` 讀檔上傳到 Odoo，避免大量 base64 佔用 LLM output token。
+>
+> ⚠️ `shared-uploads` 是 Docker named volume，只能在「同一台 Docker host」共享。client 與 server **跨機器**時無法共用此 volume，只能改用 `base64_data` 模式傳檔。詳見 `docker-compose.example.yml` 註解。
 
 ```sh
 claude mcp add --transport http odoo-mcp https://your-cloud-server.com:8000/mcp
@@ -268,11 +278,31 @@ claude mcp add --transport http odoo-mcp https://your-cloud-server.com:8000/mcp
 | `delete_record` | 刪除記錄（需二次確認） | No |
 | `execute_method` | 執行模型方法 | Depends |
 
-## Claude Code MCP 設定
+## Docker 建置
+
+部分 client 的 Docker 設定（Claude Code / Gemini 的 Docker 版本）需要先建置本機映像檔：
+
+```bash
+docker build -t odoo-mcp-server .
+```
+
+## MCP Client 設定
+
+本專案支援以下 MCP Client，各自的完整設定步驟見對應章節：
+
+| Client | 加入方式 | 設定檔 |
+|--------|----------|--------|
+| [Claude Code](#claude-code) | `claude mcp add` | `~/.claude.json` |
+| [Gemini CLI](#gemini-cli) | `gemini mcp add` | `~/.gemini/settings.json` |
+| [Antigravity CLI](#antigravity-cli) | 手動編輯 | `~/.gemini/config/mcp_config.json` |
+| [OpenClaw](#openclaw) | `openclaw mcp set` | OpenClaw config |
+| [Codex CLI](#codex-cli) | `codex mcp add` + 手動編輯 | `~/.codex/config.toml` |
+
+### Claude Code
 
 設定檔位於 `~/.claude.json`：
 
-### 本機執行
+#### 本機執行
 
 ```sh
 claude mcp add odoo-mcp-server -- python odoo_mcp_server.py
@@ -296,7 +326,7 @@ claude mcp add odoo-mcp-server -- python odoo_mcp_server.py
 
 </details>
 
-### Docker（host.docker.internal）
+#### Docker（host.docker.internal）
 
 適用於 Odoo 執行在本機的情況：
 
@@ -332,7 +362,7 @@ claude mcp add odoo-mcp-server -- docker run -i --rm --add-host=host.docker.inte
 
 </details>
 
-### Docker（host network）
+#### Docker（host network）
 
 使用主機網路模式：
 
@@ -369,7 +399,7 @@ claude mcp add odoo-mcp-server -- docker run -i --rm --network host -e ODOO_URL=
 
 </details>
 
-### Docker（遠端 Odoo）
+#### Docker（遠端 Odoo）
 
 ```sh
 claude mcp add odoo-mcp-server -- docker run -i --rm -e ODOO_URL=https://example.com/ -e ODOO_DATABASE=odoo19 -e ODOO_API_KEY=your_api_key_here odoo-mcp-server
@@ -402,13 +432,7 @@ claude mcp add odoo-mcp-server -- docker run -i --rm -e ODOO_URL=https://example
 
 </details>
 
-## Docker 建置
-
-```bash
-docker build -t odoo-mcp-server .
-```
-
-## Gemini MCP 設定
+### Gemini CLI
 
 ```sh
 gemini mcp add --scope user odoo-mcp docker -- run -i --rm --add-host=host.docker.internal:host-gateway -e ODOO_URL=http://host.docker.internal:8069 -e ODOO_DATABASE=odoo19 -e ODOO_API_KEY=your_api_key_here odoo-mcp-server
@@ -442,30 +466,31 @@ gemini mcp add --scope user odoo-mcp docker -- run -i --rm --add-host=host.docke
 
 </details>
 
-## Antigravity CLI MCP 設定
+### Antigravity CLI
 
 > 自 2026/6/18 起個人版 Gemini CLI 停止服務，改用 [Antigravity CLI](https://antigravity.google/)。目前 **沒有** `mcp add` 子指令，需手動編輯設定檔。
 
 設定檔路徑為 `~/.gemini/config/mcp_config.json`（Antigravity CLI / IDE / SDK 共用，等同 Gemini CLI 的 `--scope user`）。
 
-JSON 格式與上方 Gemini MCP 設定相同.
+JSON 格式與上方 Gemini CLI 設定相同。
 
 設定後進入 Antigravity CLI 以 `/mcp` 指令重新載入，並確認連線狀態。
 
-## OpenClaw MCP 設定
+### OpenClaw
 
 OpenClaw 透過 CLI 管理 MCP server，設定會寫入 `mcp.servers.<name>`。
 
 > `/mcp` 指令為 **owner-only 且預設關閉**，需以 `commands.mcp: true` 開啟才能在 chat session 中使用。
 
-### 步驟 1：註冊 MCP server
+#### 步驟 1：註冊 MCP server
 
 ```sh
-openclaw mcp set <name> '<JSON>'
-
-# 範例（請將 your-server-ip 換成你的 MCP server 位址）：
+# 請將 your-server-ip 換成你的 MCP server 位址
 openclaw mcp set odoo-mcp '{"type":"http","url":"http://your-server-ip:8000/mcp"}'
 ```
+
+<details>
+<summary><b>手動設定 JSON（寫入 OpenClaw 設定的 `mcp.servers`）</b></summary>
 
 OpenClaw 會自動正規化設定，把 `type:"http"` 轉成 `transport:"streamable-http"` 後存入：
 
@@ -482,13 +507,15 @@ OpenClaw 會自動正規化設定，把 `type:"http"` 轉成 `transport:"streama
 }
 ```
 
-### 步驟 2：開啟 `/mcp` 指令
+</details>
+
+#### 步驟 2：開啟 `/mcp` 指令
 
 ```sh
 openclaw config set commands.mcp true
 ```
 
-### 步驟 3：重啟 Gateway 套用設定
+#### 步驟 3：重啟 Gateway 套用設定
 
 ```sh
 openclaw gateway restart
@@ -496,7 +523,7 @@ openclaw gateway restart
 
 > 若想等進行中的工作排空再重啟，可改用 `openclaw gateway restart --safe`。
 
-### 驗證
+#### 驗證
 
 ```sh
 # server 是否註冊成功
@@ -508,6 +535,36 @@ openclaw config get commands.mcp
 ```
 
 完成後請**開一個新的 chat session（或硬重整 dashboard），再輸入 `/mcp`** 確認 `odoo-mcp` 連線狀態。
+
+### Codex CLI
+
+> Codex 的 `codex mcp add` **只支援 stdio（`command` / `args`）**，並不支援 url（streamable HTTP）形式的遠端 server。因此要連雲端 HTTP 模式的 MCP server，需先用佔位指令建立設定，再手動編輯 `~/.codex/config.toml`。
+
+```sh
+codex mcp add odoo-mcp -- echo placeholder
+```
+
+<details>
+<summary><b>手動設定 TOML（修改 `~/.codex/config.toml`）</b></summary>
+
+`codex mcp add` 產生的佔位設定：
+
+```toml
+[mcp_servers.odoo-mcp]
+command = "echo"
+args = ["placeholder"]
+```
+
+手動改為 url（streamable HTTP）：
+
+```toml
+[mcp_servers.odoo-mcp]
+url = "https://your-cloud-server.com:8000/mcp"
+```
+
+> 若遠端 server 需要認證，可額外加上 `bearer_token_env_var = "ODOO_MCP_TOKEN"` 或自訂 `http_headers`。
+
+</details>
 
 ## 安全機制
 
