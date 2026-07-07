@@ -572,7 +572,8 @@ url = "https://your-cloud-server.com:8000/mcp"
 
 設定 `READONLY_MODE=true` 啟用唯讀模式，適用於生產環境查詢：
 
-- 寫入工具（`create_record`、`update_record`、`delete_record`、`execute_method`）透過 FastMCP tags 直接隱藏，LLM 不會看到這些工具
+- 寫入工具（`create_record`、`update_record`、`delete_record`、`execute_method`、`add_attachment`）在註冊時即被停用——LLM 看不到這些工具，直接呼叫也會被拒絕
+- 停用發生在模組層級，任何啟動方式（`python odoo_mcp_server.py`、`fastmcp run`、`fastmcp dev`）都同樣生效
 
 ### 刪除二次確認
 

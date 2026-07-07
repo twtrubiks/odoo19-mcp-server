@@ -684,7 +684,8 @@ def create_record(
         The 'url' field provides direct browser access to the created record(s).
 
     Note:
-        In READONLY_MODE, this tool is hidden from LLM via tags.
+        In READONLY_MODE, this tool is disabled at registration time
+        (hidden from LLM and direct calls are rejected).
     """
     result = client.create(model, values)
     if isinstance(values, list):
@@ -734,7 +735,8 @@ def update_record(
         - error: Error message (only if success=False)
 
     Note:
-        In READONLY_MODE, this tool is hidden from LLM via tags.
+        In READONLY_MODE, this tool is disabled at registration time
+        (hidden from LLM and direct calls are rejected).
     """
     result = client.write(model, ids, values)
 
@@ -832,7 +834,8 @@ def add_attachment(
         JSON string with attachment ID, URL, and linked record info.
 
     Note:
-        In READONLY_MODE, this tool is hidden from LLM via tags.
+        In READONLY_MODE, this tool is disabled at registration time
+        (hidden from LLM and direct calls are rejected).
     """
     if file_path and base64_data:
         raise ToolError("Provide either 'file_path' or 'base64_data', not both.")
@@ -885,6 +888,14 @@ def add_attachment(
     return json.dumps(result, indent=2)
 
 
+# READONLY_MODE 的處理必須在模組層級（而非 __main__）：
+# fastmcp run / fastmcp dev 以 import 方式載入本模組，不會執行 __main__。
+# mcp.disable(tags={"write"}) 會同時「隱藏工具」並「拒絕直接呼叫」（Unknown tool）。
+if READONLY_MODE:
+    mcp.disable(tags={"write"})
+    print("⚠️  READONLY_MODE is enabled. Write tools are disabled.", file=sys.stderr)
+
+
 # =============================================================================
 # Main Entry Point
 # =============================================================================
@@ -900,10 +911,6 @@ if __name__ == "__main__":
     parser.add_argument("--host", default="127.0.0.1", help="Host for HTTP/SSE transport")
     parser.add_argument("--port", type=int, default=8000, help="Port for HTTP/SSE transport")
     args = parser.parse_args()
-
-    if READONLY_MODE:
-        mcp.disable(tags={"write"})
-        print("⚠️  READONLY_MODE is enabled. Write tools are hidden.", file=sys.stderr)
 
     if args.transport == "stdio":
         mcp.run()

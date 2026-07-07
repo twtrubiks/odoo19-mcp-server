@@ -1,11 +1,16 @@
 """Tests for odoo_mcp_server — 只測有實際邏輯、容易藏 bug 的地方."""
 
+import asyncio
+import importlib
 import json
+import os
 from unittest.mock import MagicMock, patch
 
 import pytest
+from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
+import odoo_mcp_server
 from odoo_mcp_server import (
     OdooJsonRpcClient,
     _sanitize_error_message,
@@ -347,3 +352,57 @@ class TestSanitizeErrorMessage:
         error_msg = str(exc_info.value)
         assert "field 'namee' does not exist" in error_msg
         assert "Traceback" not in error_msg
+
+
+# =============================================================================
+# 8. READONLY_MODE 停用寫入工具 — 模組層級 mcp.disable(tags={"write"})
+#    （守住停用機制的回歸：模組層級停用，各啟動方式皆生效）
+# =============================================================================
+
+WRITE_TOOLS = {"create_record", "update_record", "delete_record", "execute_method", "add_attachment"}
+
+
+@pytest.fixture
+def readonly_module():
+    """設定 READONLY_MODE=true 後 reload 模組（模擬 fastmcp run 的 import 式載入），
+    結束後還原."""
+    os.environ["READONLY_MODE"] = "true"
+    importlib.reload(odoo_mcp_server)
+    yield odoo_mcp_server
+    del os.environ["READONLY_MODE"]
+    importlib.reload(odoo_mcp_server)
+
+
+class TestReadonlyDisablesWriteTools:
+    """測試 READONLY_MODE 下，寫入工具在 MCP 層被隱藏且拒絕呼叫."""
+
+    def test_write_tools_hidden_from_list(self, readonly_module):
+        """tools/list 不應出現任何 write tag 的工具，唯讀工具照常存在."""
+
+        async def _list():
+            async with Client(readonly_module.mcp) as client:
+                return {tool.name for tool in await client.list_tools()}
+
+        names = asyncio.run(_list())
+        assert not (names & WRITE_TOOLS)
+        assert "search_records" in names
+
+    def test_write_tool_call_rejected(self, readonly_module):
+        """直接呼叫被停用的工具 → 拒絕（不只是隱藏）."""
+
+        async def _call():
+            async with Client(readonly_module.mcp) as client:
+                await client.call_tool("create_record", {"model": "res.partner", "values": {}})
+
+        with pytest.raises(ToolError, match="Unknown tool"):
+            asyncio.run(_call())
+
+    def test_normal_mode_shows_write_tools(self):
+        """未設定 READONLY_MODE → 寫入工具正常可見."""
+
+        async def _list():
+            async with Client(odoo_mcp_server.mcp) as client:
+                return {tool.name for tool in await client.list_tools()}
+
+        names = asyncio.run(_list())
+        assert names >= WRITE_TOOLS
