@@ -247,6 +247,8 @@ services:
 > **圖片 / 附件傳遞**：`add_attachment` 的 `file_path` 模式會從 `/shared/uploads/` 讀檔上傳到 Odoo，避免大量 base64 佔用 LLM output token。
 >
 > ⚠️ `shared-uploads` 是 Docker named volume，只能在「同一台 Docker host」共享。client 與 server **跨機器**時無法共用此 volume，只能改用 `base64_data` 模式傳檔。詳見 `docker-compose.example.yml` 註解。
+>
+> 🔒 `file_path` 僅允許讀取 `UPLOAD_DIR`（預設 `/shared/uploads`）底下的檔案，`resolve()` 後越界一律拒絕（含指向外部的 symlink）。這是為了防止被 prompt injection 的 LLM 用 `file_path="/app/.env"` 把 server 機密讀出、上傳成附件外洩。純本機 stdio 若要放行任意路徑，設 `UPLOAD_DIR=/`（等於解除限制，自負風險）。
 
 > **連不上、回 `Invalid host header`？** 這是底層 MCP SDK 的 **DNS rebinding 防護**——用非 localhost 的 IP／網域連進來時，Host 標頭不在允許清單內就會被擋。用 `FASTMCP_HTTP_ALLOWED_HOSTS` 放行：
 >
@@ -619,6 +621,21 @@ openssl rand -hex 32
 
 - 啟用後 `/mcp` 端點要求 `Authorization: Bearer <token>`，未帶或錯誤一律回 401
 - 未設定時行為與過去版本相同（無認證），但 HTTP/SSE 模式啟動時會在 stderr 印出警告
+
+### 附件檔案讀取範圍（`UPLOAD_DIR`）
+
+`add_attachment` 的 `file_path` 模式是本 server 唯一會讀取 MCP 主機本地檔案的入口。
+若不設限，被 prompt injection 的 LLM 可用 `file_path="/app/.env"` 把 server 機密
+（含 `ODOO_API_KEY` 本身）讀出、上傳成 Odoo 附件外洩——這是 confused deputy，
+`MCP_AUTH_TOKEN` 擋不住（LLM 本來就是合法持 token 的 client）。
+
+因此 `file_path` 被限制在 `UPLOAD_DIR`（預設 `/shared/uploads`）底下：
+
+- 路徑經 `Path.resolve()` 正規化後，必須落在 `UPLOAD_DIR` 內，否則回 `ToolError`
+- `resolve()` 會一併解掉 symlink，所以「白名單目錄裡放一個指向外部的 symlink」也擋得掉
+- 預設值對齊 compose 的 `/shared/uploads` 圖片傳遞通道，Docker 部署無需額外設定
+- 純本機 stdio 若要放行任意路徑，設 `UPLOAD_DIR=/`（等於解除限制，自負風險）
+- 檔案不在磁碟上（如 Discord 上傳的圖片）時，改用 `base64_data` 模式，不受此限制
 
 ### 唯讀模式
 

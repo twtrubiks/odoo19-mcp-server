@@ -39,6 +39,10 @@ services:
       - READONLY_MODE=${READONLY_MODE:-false}
       # HTTP 模式的 Bearer Token 認證（未設定＝無認證，見 README「安全機制」）
       - MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN:-}
+      # add_attachment 的 file_path 僅允許讀取 UPLOAD_DIR 底下的檔案（預設 /shared/uploads，
+      # 對應下方掛載的 shared-uploads volume，故此處免設即可運作）。
+      # 設為 / 等於解除限制、放行任意路徑，自負風險。
+      # - UPLOAD_DIR=/shared/uploads
       # HTTP 模式的 Host 標頭防護（DNS rebinding protection，來自底層 MCP SDK）：
       # 用非 localhost 的 IP／網域連進來時，預設會被擋下並回 "Invalid host header"。
       # ⚠️ 快速測試可先全開（等於對任何 Host 開放，切勿用於正式環境）：

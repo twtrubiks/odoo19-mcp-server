@@ -16,10 +16,12 @@ import odoo_mcp_server
 from odoo_mcp_server import (
     OdooJsonRpcClient,
     _sanitize_error_message,
+    add_attachment,
     create_record,
     delete_record,
     execute_method,
     handle_tool_errors,
+    resolve_upload_path,
     search_records,
 )
 
@@ -256,6 +258,64 @@ class TestExecuteMethodUnlinkBlock:
         )
         assert result == 42
         mock_client.execute.assert_called_once()
+
+
+# =============================================================================
+# 5.5 add_attachment 的 file_path 限制在 UPLOAD_DIR（防任意檔案讀取外洩）
+# =============================================================================
+
+
+class TestUploadDirConfinement:
+    """file_path 只能讀 UPLOAD_DIR 底下的檔案，越界（含 symlink）一律拒絕."""
+
+    def test_path_inside_upload_dir_allowed(self, tmp_path, monkeypatch):
+        """UPLOAD_DIR 內的真實檔案 → resolve_upload_path 回傳解析後路徑."""
+        monkeypatch.setattr("odoo_mcp_server.UPLOAD_DIR", tmp_path)
+        f = tmp_path / "invoice.png"
+        f.write_bytes(b"data")
+        assert resolve_upload_path(str(f)) == f.resolve()
+
+    def test_path_outside_upload_dir_rejected(self, tmp_path, monkeypatch):
+        """UPLOAD_DIR 外的路徑（如 /etc/passwd）→ ToolError，且不洩漏檔案是否存在."""
+        upload = tmp_path / "uploads"
+        upload.mkdir()
+        outside = tmp_path / "secret.env"
+        outside.write_bytes(b"ODOO_API_KEY=leak")
+        monkeypatch.setattr("odoo_mcp_server.UPLOAD_DIR", upload)
+        with pytest.raises(ToolError, match="UPLOAD_DIR"):
+            resolve_upload_path(str(outside))
+
+    def test_traversal_escape_rejected(self, tmp_path, monkeypatch):
+        """'..' 逃逸到 UPLOAD_DIR 外 → resolve() 正規化後被擋."""
+        upload = tmp_path / "uploads"
+        upload.mkdir()
+        monkeypatch.setattr("odoo_mcp_server.UPLOAD_DIR", upload)
+        with pytest.raises(ToolError, match="UPLOAD_DIR"):
+            resolve_upload_path(str(upload / ".." / "secret.env"))
+
+    def test_symlink_pointing_outside_rejected(self, tmp_path, monkeypatch):
+        """UPLOAD_DIR 內指向外部的 symlink → resolve() 解掉後仍在外，被擋."""
+        upload = tmp_path / "uploads"
+        upload.mkdir()
+        secret = tmp_path / "secret.env"
+        secret.write_bytes(b"ODOO_API_KEY=leak")
+        link = upload / "innocent.png"
+        link.symlink_to(secret)
+        monkeypatch.setattr("odoo_mcp_server.UPLOAD_DIR", upload)
+        with pytest.raises(ToolError, match="UPLOAD_DIR"):
+            resolve_upload_path(str(link))
+
+    def test_add_attachment_rejects_outside_path_before_touching_client(self, tmp_path, monkeypatch):
+        """add_attachment 對越界 file_path 先擋下，不讀檔也不碰 client."""
+        upload = tmp_path / "uploads"
+        upload.mkdir()
+        outside = tmp_path / "secret.env"
+        outside.write_bytes(b"ODOO_API_KEY=leak")
+        monkeypatch.setattr("odoo_mcp_server.UPLOAD_DIR", upload)
+        mock_client = MagicMock()
+        with pytest.raises(ToolError, match="UPLOAD_DIR"):
+            add_attachment(file_path=str(outside), client=mock_client)
+        mock_client.create.assert_not_called()
 
 
 # =============================================================================

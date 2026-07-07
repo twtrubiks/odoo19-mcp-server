@@ -11,6 +11,8 @@ Environment Variables:
     READONLY_MODE: Set to "true" to disable write operations (default: false)
     MCP_AUTH_TOKEN: Bearer token for HTTP/SSE transport authentication
         (optional; unset = no authentication, stdio is unaffected)
+    UPLOAD_DIR: Directory that add_attachment's file_path mode is confined to
+        (default: /shared/uploads). Set to "/" to allow any path.
 """
 
 __version__ = "1.0.0"
@@ -47,10 +49,38 @@ ODOO_API_KEY = os.getenv("ODOO_API_KEY", "your_api_key_here")
 READONLY_MODE = os.getenv("READONLY_MODE", "false").lower() == "true"
 MCP_AUTH_TOKEN = os.getenv("MCP_AUTH_TOKEN")
 
+# add_attachment 的 file_path 模式會讀 MCP 主機的本地檔案，是本 server 唯一的
+# 本機檔案讀取原語。若不設限，被 prompt injection 的 LLM 可用 file_path="/app/.env"
+# 把 API key 等機密讀出、上傳成 Odoo 附件外洩（confused deputy）。因此把 file_path
+# 限制在 UPLOAD_DIR 底下——預設對齊 compose 的 /shared/uploads 圖片傳遞通道。
+# 純本機 stdio 若要放行任意路徑，明確設 UPLOAD_DIR=/ 自行放寬。
+# （os.getenv(...) or ... 讓「未設」與「設為空字串」都落回預設，避免空字串 resolve 成 cwd。）
+UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR") or "/shared/uploads").resolve()
+
 
 # =============================================================================
 # Helper Functions
 # =============================================================================
+
+
+def resolve_upload_path(file_path: str) -> Path:
+    """Resolve file_path and enforce that it stays inside UPLOAD_DIR.
+
+    UPLOAD_DIR is the sole guard on add_attachment's local-file read: without
+    it, a prompt-injected caller could read arbitrary host files (e.g. the
+    server's own .env holding ODOO_API_KEY) and exfiltrate them as an Odoo
+    attachment. resolve() collapses symlinks and '..', so a symlink planted
+    inside UPLOAD_DIR that points outside it is also rejected.
+    """
+    base = UPLOAD_DIR.resolve()
+    resolved = Path(file_path).resolve()
+    if not resolved.is_relative_to(base):
+        raise ToolError(
+            f"file_path must resolve to a location inside UPLOAD_DIR ({base}); "
+            f"refusing to read '{file_path}'. Move the file there, set UPLOAD_DIR "
+            "to widen the allowed location, or pass the content via base64_data."
+        )
+    return resolved
 
 
 def format_datetime(obj: Any) -> str:
@@ -843,13 +873,16 @@ def add_attachment(
     Upload a file attachment to Odoo via ir.attachment.
 
     Supports two input modes:
-    - file_path: Read a local file from the MCP server's filesystem.
+    - file_path: Read a local file from the MCP server's filesystem. The path
+      must resolve to a location inside UPLOAD_DIR (default /shared/uploads);
+      paths outside it are refused.
     - base64_data + file_name: Pass file content directly as base64 string.
       Use this when the file is not on disk (e.g., image uploaded via Discord).
 
     Args:
-        file_path: Absolute path to a local file (e.g., '/tmp/invoice.png').
-                   Mutually exclusive with base64_data.
+        file_path: Path to a local file the MCP server can read. Must resolve
+                   to a location inside UPLOAD_DIR (default /shared/uploads);
+                   paths outside it are refused. Mutually exclusive with base64_data.
         base64_data: File content as a base64-encoded string.
                      Mutually exclusive with file_path.
         file_name: Filename for the attachment (e.g., 'invoice.png').
@@ -871,7 +904,7 @@ def add_attachment(
         raise ToolError("Either 'file_path' or 'base64_data' must be provided.")
 
     if file_path:
-        path = Path(file_path)
+        path = resolve_upload_path(file_path)
         if not path.is_file():
             raise ToolError(f"File not found: {file_path}")
         file_data = base64.b64encode(path.read_bytes()).decode("ascii")
