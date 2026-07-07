@@ -516,7 +516,7 @@ def get_fields(
     return json.dumps(result, indent=2, ensure_ascii=False)
 
 
-@mcp.tool(tags={"write"})
+@mcp.tool(tags={"write"}, annotations={"destructiveHint": True})
 @handle_tool_errors
 def execute_method(
     model: str,
@@ -526,7 +526,12 @@ def execute_method(
     client: OdooJsonRpcClient = Depends(get_shared_client),
 ) -> str:
     """
-    Execute any method on an Odoo model.
+    Execute any method on an Odoo model (general-purpose escape hatch).
+
+    WARNING: This tool is NOT guarded by this server. Business methods
+    (e.g. action_confirm, action_post, button_validate, toggle_active)
+    can modify or irreversibly change data in Odoo. Before calling any
+    method that changes state, make sure the user explicitly asked for it.
 
     Args:
         model: Model name (e.g., 'res.partner')
@@ -538,8 +543,17 @@ def execute_method(
         JSON string with the method result
 
     Note:
-        In READONLY_MODE, write methods (create, write, unlink, copy) are blocked.
+        - 'unlink' is blocked here. Use the delete_record tool instead,
+          which enforces a user confirmation step.
+        - In READONLY_MODE, write tools are disabled at the module level
+          (hidden from LLM and direct calls are rejected).
     """
+    if method == "unlink":
+        raise ToolError(
+            "Method 'unlink' is not allowed via execute_method. "
+            "Use the 'delete_record' tool instead, which requires "
+            "user confirmation before irreversible deletion."
+        )
     check_readonly_mode(method)
     args = args or []
     kwargs = kwargs or {}

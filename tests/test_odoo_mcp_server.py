@@ -226,6 +226,36 @@ class TestExecuteMethodReadonly:
         mock_client.execute.assert_called_once()
 
 
+class TestExecuteMethodUnlinkBlock:
+    """測試 execute_method 攔下 unlink，不能繞過 delete_record 的 confirm 閘門."""
+
+    def test_unlink_blocked_and_redirected(self):
+        """method='unlink' → ToolError 指路 delete_record，不碰 client."""
+        mock_client = MagicMock()
+        with pytest.raises(ToolError, match="delete_record"):
+            execute_method(model="res.partner", method="unlink", args=[[1, 2]], client=mock_client)
+        mock_client.execute.assert_not_called()
+
+    def test_unlink_blocked_even_in_readonly(self, monkeypatch):
+        """unlink 的攔截先於 readonly 檢查，兩種模式下都擋."""
+        monkeypatch.setattr("odoo_mcp_server.READONLY_MODE", True)
+        mock_client = MagicMock()
+        with pytest.raises(ToolError, match="delete_record"):
+            execute_method(model="res.partner", method="unlink", args=[[1]], client=mock_client)
+        mock_client.execute.assert_not_called()
+
+    def test_other_write_methods_still_allowed(self, monkeypatch):
+        """非 readonly 時，unlink 以外的寫入方法（如 create）仍放行."""
+        monkeypatch.setattr("odoo_mcp_server.READONLY_MODE", False)
+        mock_client = MagicMock()
+        mock_client.execute.return_value = 42
+        result = json.loads(
+            execute_method(model="res.partner", method="create", args=[{"name": "x"}], client=mock_client)
+        )
+        assert result == 42
+        mock_client.execute.assert_called_once()
+
+
 # =============================================================================
 # 6. handle_tool_errors — 統一錯誤處理 decorator
 # =============================================================================

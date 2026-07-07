@@ -276,7 +276,7 @@ claude mcp add --transport http odoo-mcp https://your-cloud-server.com:8000/mcp
 | `create_record` | 建立記錄 | No |
 | `update_record` | 更新記錄 | No |
 | `delete_record` | 刪除記錄（需二次確認） | No |
-| `execute_method` | 執行模型方法 | Depends |
+| `execute_method` | 執行任意模型方法（萬用入口，`unlink` 已封鎖，見[安全機制](#安全機制)） | No |
 
 ## Docker 建置
 
@@ -578,6 +578,19 @@ url = "https://your-cloud-server.com:8000/mcp"
 ### 刪除二次確認
 
 `delete_record` 內建 confirm 機制，LLM 必須先以 `confirm=False` 呼叫取得確認提示，經使用者同意後才能以 `confirm=True` 執行刪除。
+`execute_method` 已攔下 `unlink`，無法用它繞過此確認流程。
+
+> 注意：confirm 參數由 LLM 自行填入，屬於「引導 LLM」層級的防護，
+> 並非強制性的安全邊界（LLM 理論上可直接傳 `confirm=True`）。
+
+### `execute_method` 的安全邊界
+
+`execute_method` 是萬用入口（escape hatch），用來呼叫沒有專用工具的模型方法，請理解其風險：
+
+- ORM 原語 `unlink` 已被攔下，會導向 `delete_record` 的二次確認流程
+- 但 `action_confirm`、`action_post`、`button_validate` 這類會改資料的**業務方法不設防**——
+  Odoo 有上千個模型方法，server 無法枚舉哪些會寫入資料庫
+- 真正的安全邊界在應該是給 MCP 使用**低權限的 Odoo 使用者** API key（最小權限原則）
 
 ## 健康檢查
 
