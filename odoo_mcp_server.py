@@ -9,6 +9,8 @@ Environment Variables:
     ODOO_DATABASE: Database name (default: odoo)
     ODOO_API_KEY: API key for authentication
     READONLY_MODE: Set to "true" to disable write operations (default: false)
+    MCP_AUTH_TOKEN: Bearer token for HTTP/SSE transport authentication
+        (optional; unset = no authentication, stdio is unaffected)
 """
 
 __version__ = "1.0.0"
@@ -30,6 +32,7 @@ from dotenv import load_dotenv
 from fastmcp import FastMCP
 from fastmcp.dependencies import Depends
 from fastmcp.exceptions import ToolError
+from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from starlette.responses import JSONResponse
 
 load_dotenv()
@@ -42,6 +45,7 @@ ODOO_URL = os.getenv("ODOO_URL", "http://localhost:8069")
 ODOO_DATABASE = os.getenv("ODOO_DATABASE", "your_database_key_here")
 ODOO_API_KEY = os.getenv("ODOO_API_KEY", "your_api_key_here")
 READONLY_MODE = os.getenv("READONLY_MODE", "false").lower() == "true"
+MCP_AUTH_TOKEN = os.getenv("MCP_AUTH_TOKEN")
 
 
 # =============================================================================
@@ -297,8 +301,18 @@ def get_shared_client() -> OdooJsonRpcClient:
     return _client
 
 
+# MCP_AUTH_TOKEN 為 opt-in 認證：設定後 HTTP/SSE 的 /mcp 端點要求
+# Authorization: Bearer <token>，未帶或錯誤一律 401；stdio 模式不受 auth 影響。
+# 必須在模組層級掛上（理由同 READONLY_MODE）：fastmcp run / dev 以 import
+# 方式載入，不會執行 __main__。
+# StaticTokenVerifier 官方標註「僅供開發測試」（token 明文存放），本專案接受此點：
+# ODOO_API_KEY 本來就以明文存於同一份環境變數，shared secret 並未擴大暴露面。
+# 注意 /health 是 custom route，不在 auth 保護範圍內（LB probe 需免認證）。
+_auth = StaticTokenVerifier(tokens={MCP_AUTH_TOKEN: {"client_id": "odoo-mcp-client"}}) if MCP_AUTH_TOKEN else None
+
 mcp = FastMCP(
     "Odoo MCP Server (JSON-RPC)",
+    auth=_auth,
     mask_error_details=True,
     instructions=(
         "你只能操作 Odoo ERP 系統中的資料（銷售、財務、庫存、聯絡人等）。"
@@ -929,4 +943,11 @@ if __name__ == "__main__":
     if args.transport == "stdio":
         mcp.run()
     else:
+        if not MCP_AUTH_TOKEN:
+            print(
+                "⚠️  MCP_AUTH_TOKEN is not set: the HTTP/SSE endpoint has NO authentication. "
+                "Anyone who can reach this port gets full ODOO_API_KEY access. "
+                "Set MCP_AUTH_TOKEN (with TLS) before exposing it beyond a trusted network.",
+                file=sys.stderr,
+            )
         mcp.run(transport=args.transport, host=args.host, port=args.port)

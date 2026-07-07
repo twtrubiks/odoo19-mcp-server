@@ -118,6 +118,7 @@ def get_current_user():
 | `ODOO_DATABASE` | 資料庫名稱 | - |
 | `ODOO_API_KEY` | API Key 認證 | - |
 | `READONLY_MODE` | 唯讀模式（禁止寫入操作） | `false` |
+| `MCP_AUTH_TOKEN` | HTTP/SSE 模式的 Bearer Token 認證（未設定＝無認證；stdio 不適用），見[安全機制](#安全機制) | -（停用） |
 
 建立 `.env` 檔案：
 
@@ -198,6 +199,10 @@ python odoo_mcp_server.py --transport sse --host 0.0.0.0 --port 8000
 
 ### 雲端部署（HTTP 模式）
 
+> ⚠️ **安全提醒**：HTTP 模式預設**沒有認證**——任何連得到該 port 的人都直接繼承
+> `ODOO_API_KEY` 的完整權限。除非 server 只在受信任的內網使用，
+> 否則請務必設定 `MCP_AUTH_TOKEN` 並搭配 TLS，詳見[安全機制](#安全機制)
+
 專案提供 `docker-compose.example.yml` 範本，複製後修改即可使用：
 
 ```bash
@@ -217,6 +222,9 @@ services:
     build: .
     command: ["python", "odoo_mcp_server.py", "--transport", "http", "--host", "0.0.0.0", "--port", "8000"]
     # 對外暴露 port 8000（host 端 client 可直接連 http://localhost:8000/mcp）。
+    # ⚠️ "8000:8000" 會綁定 0.0.0.0：同網段的所有機器都連得到
+    # （主機若有公網 IP，就是整個網際網路），且 Docker 發佈的 port 會繞過 ufw 防火牆規則。
+    # 建議設定 MCP_AUTH_TOKEN（見 environment）；只給本機 client 用可改 "127.0.0.1:8000:8000"。
     # 若只需 Docker 內網存取（例如 client 也在同一個 compose 裡），可整段移除 ports。
     ports:
       - "8000:8000"
@@ -225,6 +233,12 @@ services:
       - ODOO_DATABASE=${ODOO_DATABASE}
       - ODOO_API_KEY=${ODOO_API_KEY}
       - READONLY_MODE=${READONLY_MODE:-false}
+      # HTTP 模式的 Bearer Token 認證（未設定＝無認證，見 README「安全機制」）
+      - MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN:-}
+      # HTTP 模式的 Host 標頭防護（DNS rebinding protection，來自底層 MCP SDK）：
+      # 用非 localhost 的 IP／網域連進來時，預設會被擋下並回 "Invalid host header"。
+      # ⚠️ 快速測試可先全開（勿用於正式環境）：
+      # - FASTMCP_HTTP_ALLOWED_HOSTS=["*"]
     volumes:
       - shared-uploads:/shared   # 圖片傳遞通道；對應 Dockerfile 預建的 /shared/uploads
     restart: unless-stopped
@@ -234,7 +248,24 @@ services:
 >
 > ⚠️ `shared-uploads` 是 Docker named volume，只能在「同一台 Docker host」共享。client 與 server **跨機器**時無法共用此 volume，只能改用 `base64_data` 模式傳檔。詳見 `docker-compose.example.yml` 註解。
 
+> **連不上、回 `Invalid host header`？** 這是底層 MCP SDK 的 **DNS rebinding 防護**——用非 localhost 的 IP／網域連進來時，Host 標頭不在允許清單內就會被擋。用 `FASTMCP_HTTP_ALLOWED_HOSTS` 放行：
+>
+> ```bash
+> # 快速測試（⚠️ 對任何 Host 開放，勿用於正式環境）
+> FASTMCP_HTTP_ALLOWED_HOSTS=["*"]
+>
+> # ✅ 正規做法：只列出 client 實際連線的 host（含 port）
+> FASTMCP_HTTP_ALLOWED_HOSTS=["your-server-ip:8000"]     # 純 IP 部署
+> FASTMCP_HTTP_ALLOWED_HOSTS=["mcp.example.com"]         # 反向代理／網域（建議搭配 TLS）
+> ```
+>
+> 官方明確警告：使用萬用字元 `*` 會讓 server 對任何來源開放，正式環境請務必列出明確 host。必要時另有 `FASTMCP_HTTP_ALLOWED_ORIGINS`（瀏覽器型 client 的 Origin 白名單）。
+
 ```sh
+# server 有設 MCP_AUTH_TOKEN 時，需帶 Authorization header
+claude mcp add --transport http odoo-mcp https://your-cloud-server.com:8000/mcp --header "Authorization: Bearer your_random_token_here"
+
+# server 未啟用認證（僅限受信任內網）
 claude mcp add --transport http odoo-mcp https://your-cloud-server.com:8000/mcp
 ```
 
@@ -246,11 +277,18 @@ claude mcp add --transport http odoo-mcp https://your-cloud-server.com:8000/mcp
   "mcpServers": {
     "odoo-mcp": {
       "type": "http",
-      "url": "https://your-cloud-server.com:8000/mcp"
+      "url": "https://your-cloud-server.com:8000/mcp",
+      "headers": {
+        "Authorization": "Bearer your_random_token_here"
+      }
     }
   }
 }
 ```
+
+> ⚠️ 純 HTTP 下 Bearer token 是明文傳輸，僅適合受信任內網／臨時測試；對外請改用 `https://`（TLS）。
+
+server 未啟用 `MCP_AUTH_TOKEN` 時，`headers` 整段可省略。
 
 </details>
 
@@ -562,11 +600,25 @@ args = ["placeholder"]
 url = "https://your-cloud-server.com:8000/mcp"
 ```
 
-> 若遠端 server 需要認證，可額外加上 `bearer_token_env_var = "ODOO_MCP_TOKEN"` 或自訂 `http_headers`。
+> 若 server 端設定了 `MCP_AUTH_TOKEN`，需加上 `bearer_token_env_var = "ODOO_MCP_TOKEN"`，
+> 並在執行 Codex 的環境中 `export ODOO_MCP_TOKEN=<與 server MCP_AUTH_TOKEN 相同的值>`；
+> 或改用自訂 `http_headers` 直接填 `Authorization` header。
 
 </details>
 
 ## 安全機制
+
+### 部署定位與 HTTP 認證（`MCP_AUTH_TOKEN`）
+
+設定 `MCP_AUTH_TOKEN` 環境變數即可啟用 Bearer Token 認證（opt-in）：
+
+```bash
+# 產生隨機 token
+openssl rand -hex 32
+```
+
+- 啟用後 `/mcp` 端點要求 `Authorization: Bearer <token>`，未帶或錯誤一律回 401
+- 未設定時行為與過去版本相同（無認證），但 HTTP/SSE 模式啟動時會在 stderr 印出警告
 
 ### 唯讀模式
 
@@ -602,6 +654,7 @@ curl http://localhost:8000/health
 ```
 
 適用於 Docker healthcheck、Kubernetes probe、load balancer 探活。stdio 模式下不影響。
+此端點**不受** `MCP_AUTH_TOKEN` 保護（不需帶 token）。
 
 ## License
 

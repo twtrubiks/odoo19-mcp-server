@@ -6,9 +6,11 @@ import json
 import os
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
+from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 
 import odoo_mcp_server
 from odoo_mcp_server import (
@@ -436,3 +438,84 @@ class TestReadonlyDisablesWriteTools:
 
         names = asyncio.run(_list())
         assert names >= WRITE_TOOLS
+
+
+# =============================================================================
+# 9. MCP_AUTH_TOKEN — HTTP transport 的 Bearer 認證（opt-in 安全機制）
+# =============================================================================
+
+TEST_TOKEN = "test-secret-token"
+
+# MCP initialize 握手請求（不需連 Odoo，適合驗證 auth 層）
+MCP_INIT_BODY = {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "initialize",
+    "params": {
+        "protocolVersion": "2025-06-18",
+        "capabilities": {},
+        "clientInfo": {"name": "pytest", "version": "0"},
+    },
+}
+MCP_HEADERS = {
+    "Accept": "application/json, text/event-stream",
+    "Content-Type": "application/json",
+}
+
+
+@pytest.fixture
+def auth_enabled_module():
+    """設定 MCP_AUTH_TOKEN 後 reload 模組（模擬 fastmcp run 的 import 式載入），
+    結束後還原為無認證狀態."""
+    os.environ["MCP_AUTH_TOKEN"] = TEST_TOKEN
+    importlib.reload(odoo_mcp_server)
+    yield odoo_mcp_server
+    del os.environ["MCP_AUTH_TOKEN"]
+    importlib.reload(odoo_mcp_server)
+
+
+def _http_request(mcp_server, path, method="POST", token=None):
+    """對 FastMCP 的 HTTP app 發一個請求，回傳 response."""
+    app = mcp_server.http_app()
+    headers = dict(MCP_HEADERS)
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    async def _run():
+        async with app.router.lifespan_context(app):
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                if method == "GET":
+                    return await client.get(path, headers=headers)
+                return await client.post(path, json=MCP_INIT_BODY, headers=headers)
+
+    return asyncio.run(_run())
+
+
+class TestMcpAuthToken:
+    """測試 MCP_AUTH_TOKEN 的 opt-in 認證：設了才驗、沒設不擋、/health 永遠豁免."""
+
+    def test_no_token_env_means_no_auth(self):
+        """未設定 MCP_AUTH_TOKEN → auth 為 None（向下相容，無認證）."""
+        assert odoo_mcp_server.mcp.auth is None
+
+    def test_token_env_enables_static_verifier(self, auth_enabled_module):
+        """設定 MCP_AUTH_TOKEN → 模組層級掛上 StaticTokenVerifier
+        （import 式載入即生效，不依賴 __main__）."""
+        assert isinstance(auth_enabled_module.mcp.auth, StaticTokenVerifier)
+
+    def test_mcp_endpoint_rejects_missing_token(self, auth_enabled_module):
+        """啟用認證後，/mcp 未帶 token → 401."""
+        response = _http_request(auth_enabled_module.mcp, "/mcp")
+        assert response.status_code == 401
+
+    def test_mcp_endpoint_accepts_valid_token(self, auth_enabled_module):
+        """啟用認證後，/mcp 帶正確 token → initialize 握手成功."""
+        response = _http_request(auth_enabled_module.mcp, "/mcp", token=TEST_TOKEN)
+        assert response.status_code == 200
+
+    def test_health_endpoint_bypasses_auth(self, auth_enabled_module):
+        """/health 是 custom route，不受 auth 保護（LB probe 需免認證）."""
+        response = _http_request(auth_enabled_module.mcp, "/health", method="GET")
+        assert response.status_code == 200
+        assert response.json()["status"] == "healthy"
