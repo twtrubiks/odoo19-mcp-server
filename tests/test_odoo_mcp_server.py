@@ -1,9 +1,13 @@
 """Tests for odoo_mcp_server — 只測有實際邏輯、容易藏 bug 的地方."""
 
 import asyncio
+import hashlib
+import hmac
 import importlib
 import json
 import os
+import time
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -15,12 +19,17 @@ from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 import odoo_mcp_server
 from odoo_mcp_server import (
     OdooJsonRpcClient,
+    _check_upload_auth,
+    _make_upload_token,
+    _safe_suffix,
     _sanitize_error_message,
+    _verify_upload_token,
     add_attachment,
     create_record,
     delete_record,
     execute_method,
     handle_tool_errors,
+    prepare_upload,
     resolve_upload_path,
     search_records,
 )
@@ -451,7 +460,7 @@ class TestSanitizeErrorMessage:
 #    （守住停用機制的回歸：模組層級停用，各啟動方式皆生效）
 # =============================================================================
 
-WRITE_TOOLS = {"create_record", "update_record", "delete_record", "execute_method", "add_attachment"}
+WRITE_TOOLS = {"create_record", "update_record", "delete_record", "execute_method", "add_attachment", "prepare_upload"}
 
 
 @pytest.fixture
@@ -579,3 +588,212 @@ class TestMcpAuthToken:
         response = _http_request(auth_enabled_module.mcp, "/health", method="GET")
         assert response.status_code == 200
         assert response.json()["status"] == "healthy"
+
+
+# =============================================================================
+# 10. /upload 端點 + add_attachment file_name 覆寫（跨機器 out-of-band 傳檔）
+# =============================================================================
+
+
+class TestSafeSuffix:
+    """_safe_suffix 只接受短的 ASCII 英數副檔名，其餘一律回空字串."""
+
+    @pytest.mark.parametrize(
+        "filename,expected",
+        [
+            ("invoice.png", ".png"),
+            ("IMG.JPEG", ".jpeg"),  # 轉小寫
+            ("noext", ""),
+            ("archive.tar.gz", ".gz"),
+            ("weird.評", ""),  # 非 ASCII
+            ("x." + "a" * 20, ""),  # 過長
+            ("bad.sh script", ""),  # 含空白非英數
+        ],
+    )
+    def test_cases(self, filename, expected):
+        assert _safe_suffix(filename) == expected
+
+
+class TestUploadAuth:
+    """_check_upload_auth：設了 MCP_AUTH_TOKEN 才驗 Bearer，沒設一律放行."""
+
+    def _req(self, authorization=None):
+        req = MagicMock()
+        req.headers = {"authorization": authorization} if authorization is not None else {}
+        return req
+
+    def test_no_token_configured_allows_all(self, monkeypatch):
+        monkeypatch.setattr("odoo_mcp_server.MCP_AUTH_TOKEN", None)
+        assert _check_upload_auth(self._req()) is True
+
+    def test_correct_bearer_passes(self, monkeypatch):
+        monkeypatch.setattr("odoo_mcp_server.MCP_AUTH_TOKEN", "secret")
+        assert _check_upload_auth(self._req("Bearer secret")) is True
+
+    def test_wrong_token_rejected(self, monkeypatch):
+        monkeypatch.setattr("odoo_mcp_server.MCP_AUTH_TOKEN", "secret")
+        assert _check_upload_auth(self._req("Bearer nope")) is False
+
+    def test_missing_header_rejected(self, monkeypatch):
+        monkeypatch.setattr("odoo_mcp_server.MCP_AUTH_TOKEN", "secret")
+        assert _check_upload_auth(self._req()) is False
+
+    def test_derived_upload_token_passes(self, monkeypatch):
+        monkeypatch.setattr("odoo_mcp_server.MCP_AUTH_TOKEN", "secret")
+        assert _check_upload_auth(self._req(f"Bearer {_make_upload_token()}")) is True
+
+
+class TestUploadTokenHelpers:
+    """prepare_upload 簽發的短效 token：HMAC 衍生、無狀態驗證、過期/竄改一律拒絕."""
+
+    def _sign(self, key: bytes, expiry: str) -> str:
+        return hmac.new(key, expiry.encode(), hashlib.sha256).hexdigest()
+
+    def test_make_and_verify_roundtrip(self, monkeypatch):
+        monkeypatch.setattr("odoo_mcp_server.MCP_AUTH_TOKEN", "secret")
+        token = _make_upload_token()
+        assert token is not None
+        assert _verify_upload_token(token) is True
+
+    def test_expired_token_rejected(self, monkeypatch):
+        monkeypatch.setattr("odoo_mcp_server.MCP_AUTH_TOKEN", "secret")
+        expiry = str(int(time.time()) - 1)
+        assert _verify_upload_token(f"{expiry}.{self._sign(b'secret', expiry)}") is False
+
+    def test_tampered_expiry_rejected(self, monkeypatch):
+        """竄改 expiry 延長效期 → HMAC 對不上，拒絕."""
+        monkeypatch.setattr("odoo_mcp_server.MCP_AUTH_TOKEN", "secret")
+        token = _make_upload_token()
+        assert token is not None
+        expiry, _, sig = token.partition(".")
+        assert _verify_upload_token(f"{int(expiry) + 9999}.{sig}") is False
+
+    def test_wrong_key_rejected(self, monkeypatch):
+        monkeypatch.setattr("odoo_mcp_server.MCP_AUTH_TOKEN", "secret")
+        expiry = str(int(time.time()) + 600)
+        assert _verify_upload_token(f"{expiry}.{self._sign(b'other-key', expiry)}") is False
+
+    def test_garbage_rejected(self, monkeypatch):
+        monkeypatch.setattr("odoo_mcp_server.MCP_AUTH_TOKEN", "secret")
+        assert _verify_upload_token("not-a-token") is False
+
+    def test_no_auth_token_configured(self, monkeypatch):
+        """未設 MCP_AUTH_TOKEN → 不簽發也不驗證（/upload 本來就不擋）."""
+        monkeypatch.setattr("odoo_mcp_server.MCP_AUTH_TOKEN", None)
+        assert _make_upload_token() is None
+        assert _verify_upload_token("123.abc") is False
+
+
+class TestPrepareUpload:
+    """prepare_upload 工具：回傳端點用法；有設 MCP_AUTH_TOKEN 才附短效 token，且絕不含 master token."""
+
+    def test_with_auth_token(self, monkeypatch):
+        monkeypatch.setattr("odoo_mcp_server.MCP_AUTH_TOKEN", "secret")
+        body = json.loads(prepare_upload())
+        assert body["endpoint"] == "/upload"
+        assert _verify_upload_token(body["upload_token"]) is True
+        assert body["expires_in_seconds"] == odoo_mcp_server.UPLOAD_TOKEN_TTL_SECONDS
+        assert "secret" not in json.dumps(body)
+
+    def test_without_auth_token(self, monkeypatch):
+        monkeypatch.setattr("odoo_mcp_server.MCP_AUTH_TOKEN", None)
+        body = json.loads(prepare_upload())
+        assert body["upload_token"] is None
+        assert body["expires_in_seconds"] is None
+
+
+def _upload_request(mcp_server, data=b"IMAGE", filename="pic.png", token=None, field="file", as_form=False):
+    """對 FastMCP 的 HTTP app POST /upload，預設送 multipart 檔案；as_form=True 送一般表單欄位."""
+    app = mcp_server.http_app()
+    headers = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    async def _run():
+        async with app.router.lifespan_context(app):
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                if as_form:
+                    return await client.post("/upload", data={field: "x"}, headers=headers)
+                return await client.post("/upload", files={field: (filename, data)}, headers=headers)
+
+    return asyncio.run(_run())
+
+
+class TestUploadEndpoint:
+    """/upload：認證、寫入 UPLOAD_DIR、檔名淨化、大小上限的端到端行為."""
+
+    def test_upload_without_auth_writes_file(self, tmp_path, monkeypatch):
+        """未設 token → 上傳成功，位元組寫進 UPLOAD_DIR，file_path 落在其中且保留副檔名."""
+        monkeypatch.setattr("odoo_mcp_server.UPLOAD_DIR", tmp_path)
+        monkeypatch.setattr("odoo_mcp_server.MCP_AUTH_TOKEN", None)
+        resp = _upload_request(odoo_mcp_server.mcp, data=b"IMAGE", filename="invoice.png")
+        assert resp.status_code == 200
+        body = resp.json()
+        stored = Path(body["file_path"])
+        assert stored.parent == tmp_path
+        assert stored.suffix == ".png"
+        assert stored.read_bytes() == b"IMAGE"
+        assert body["file_name"] == "invoice.png"
+
+    def test_upload_requires_token_when_configured(self, tmp_path, monkeypatch):
+        """設了 token 但沒帶 → 401，且不寫檔（custom route 不受 MCP 認證保護，靠自檢）."""
+        monkeypatch.setattr("odoo_mcp_server.UPLOAD_DIR", tmp_path)
+        monkeypatch.setattr("odoo_mcp_server.MCP_AUTH_TOKEN", "secret")
+        resp = _upload_request(odoo_mcp_server.mcp, token=None)
+        assert resp.status_code == 401
+        assert list(tmp_path.iterdir()) == []
+
+    def test_upload_accepts_correct_token(self, tmp_path, monkeypatch):
+        """設了 token 且帶對 → 200."""
+        monkeypatch.setattr("odoo_mcp_server.UPLOAD_DIR", tmp_path)
+        monkeypatch.setattr("odoo_mcp_server.MCP_AUTH_TOKEN", "secret")
+        resp = _upload_request(odoo_mcp_server.mcp, token="secret")
+        assert resp.status_code == 200
+
+    def test_upload_accepts_derived_token(self, tmp_path, monkeypatch):
+        """帶 prepare_upload 簽發的短效衍生 token → 200（master token 不用出場）."""
+        monkeypatch.setattr("odoo_mcp_server.UPLOAD_DIR", tmp_path)
+        monkeypatch.setattr("odoo_mcp_server.MCP_AUTH_TOKEN", "secret")
+        resp = _upload_request(odoo_mcp_server.mcp, token=_make_upload_token())
+        assert resp.status_code == 200
+
+    def test_missing_file_field_rejected(self, tmp_path, monkeypatch):
+        """沒有 multipart 'file' 欄位 → 400."""
+        monkeypatch.setattr("odoo_mcp_server.UPLOAD_DIR", tmp_path)
+        monkeypatch.setattr("odoo_mcp_server.MCP_AUTH_TOKEN", None)
+        resp = _upload_request(odoo_mcp_server.mcp, field="notfile", as_form=True)
+        assert resp.status_code == 400
+
+    def test_oversized_upload_rejected(self, tmp_path, monkeypatch):
+        """超過 UPLOAD_MAX_BYTES → 拒絕且不寫檔."""
+        monkeypatch.setattr("odoo_mcp_server.UPLOAD_DIR", tmp_path)
+        monkeypatch.setattr("odoo_mcp_server.MCP_AUTH_TOKEN", None)
+        monkeypatch.setattr("odoo_mcp_server.UPLOAD_MAX_BYTES", 4)
+        resp = _upload_request(odoo_mcp_server.mcp, data=b"way too big")
+        assert resp.status_code in (400, 413)
+        assert list(tmp_path.iterdir()) == []
+
+
+class TestAddAttachmentFileNameOverride:
+    """add_attachment 的 file_path 模式支援 file_name 覆寫（把 /upload 的 uuid 名還原成原名）."""
+
+    def test_file_name_override_used(self, tmp_path, monkeypatch):
+        """帶 file_name → Odoo 附件名用 file_name."""
+        monkeypatch.setattr("odoo_mcp_server.UPLOAD_DIR", tmp_path)
+        f = tmp_path / "abcdef123456.png"
+        f.write_bytes(b"IMAGE")
+        mock_client = MagicMock()
+        mock_client.create.return_value = 7
+        add_attachment(file_path=str(f), file_name="invoice.png", client=mock_client)
+        assert mock_client.create.call_args.args[1]["name"] == "invoice.png"
+
+    def test_defaults_to_disk_name(self, tmp_path, monkeypatch):
+        """未帶 file_name → 用磁碟檔名（既有行為不變）."""
+        monkeypatch.setattr("odoo_mcp_server.UPLOAD_DIR", tmp_path)
+        f = tmp_path / "invoice.png"
+        f.write_bytes(b"IMAGE")
+        mock_client = MagicMock()
+        mock_client.create.return_value = 7
+        add_attachment(file_path=str(f), client=mock_client)
+        assert mock_client.create.call_args.args[1]["name"] == "invoice.png"

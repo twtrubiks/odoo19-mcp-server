@@ -238,17 +238,13 @@ services:
       # HTTP 模式的 Host 標頭防護（DNS rebinding protection，來自底層 MCP SDK）：
       # 用非 localhost 的 IP／網域連進來時，預設會被擋下並回 "Invalid host header"。
       # ⚠️ 快速測試可先全開（勿用於正式環境）：
-      # - FASTMCP_HTTP_ALLOWED_HOSTS=["*"]
+      - FASTMCP_HTTP_ALLOWED_HOSTS=["*"]
     volumes:
       - shared-uploads:/shared   # 圖片傳遞通道；對應 Dockerfile 預建的 /shared/uploads
     restart: unless-stopped
 ```
 
-> **圖片 / 附件傳遞**：`add_attachment` 的 `file_path` 模式會從 `/shared/uploads/` 讀檔上傳到 Odoo，避免大量 base64 佔用 LLM output token。
->
-> ⚠️ `shared-uploads` 是 Docker named volume，只能在「同一台 Docker host」共享。client 與 server **跨機器**時無法共用此 volume，只能改用 `base64_data` 模式傳檔。詳見 `docker-compose.example.yml` 註解。
->
-> 🔒 `file_path` 僅允許讀取 `UPLOAD_DIR`（預設 `/shared/uploads`）底下的檔案，`resolve()` 後越界一律拒絕（含指向外部的 symlink）。這是為了防止被 prompt injection 的 LLM 用 `file_path="/app/.env"` 把 server 機密讀出、上傳成附件外洩。純本機 stdio 若要放行任意路徑，設 `UPLOAD_DIR=/`（等於解除限制，自負風險）。
+> **圖片 / 附件傳遞**：`add_attachment` 的 `file_path` 模式會從 `/shared/uploads/` 讀檔上傳到 Odoo，避免大量 base64 佔用 LLM output token。client 與 server **跨機器**（不共用此 volume）時，改走 `prepare_upload` → `/upload` 把檔案送進 `UPLOAD_DIR`，詳見[安全機制](#安全機制)。
 
 > **連不上、回 `Invalid host header`？** 這是底層 MCP SDK 的 **DNS rebinding 防護**——用非 localhost 的 IP／網域連進來時，Host 標頭不在允許清單內就會被擋。用 `FASTMCP_HTTP_ALLOWED_HOSTS` 放行：
 >
@@ -317,6 +313,8 @@ server 未啟用 `MCP_AUTH_TOKEN` 時，`headers` 整段可省略。
 | `update_record` | 更新記錄 | No |
 | `delete_record` | 刪除記錄（需二次確認） | No |
 | `execute_method` | 執行任意模型方法（萬用入口，`unlink` 已封鎖，見[安全機制](#安全機制)） | No |
+| `add_attachment` | 上傳附件到 Odoo（`file_path` / `base64_data` 兩種模式，見[安全機制](#安全機制)） | No |
+| `prepare_upload` | 取得 `/upload` 端點用法與短效 `upload_token`（跨機器傳檔，見[安全機制](#安全機制)） | No |
 
 ## Docker 建置
 
@@ -636,6 +634,37 @@ openssl rand -hex 32
 - 預設值對齊 compose 的 `/shared/uploads` 圖片傳遞通道，Docker 部署無需額外設定
 - 純本機 stdio 若要放行任意路徑，設 `UPLOAD_DIR=/`（等於解除限制，自負風險）
 - 檔案不在磁碟上（如 Discord 上傳的圖片）時，改用 `base64_data` 模式，不受此限制
+
+### 跨機器上傳圖片（`prepare_upload` → `/upload`）
+
+當 client 與 server **不在同一台機器**時，`shared-uploads` volume 用不到，`file_path`
+沒有共用檔案系統可讀；若改走 `base64_data`，整包 base64 會流經 LLM 的 token stream，又慢又貴。
+
+`/upload` 提供一條 out-of-band 的檔案通道：client 用普通 HTTP POST 把位元組直接推到 server
+（不經 LLM），server 存進 `UPLOAD_DIR` 後回傳 `file_path`，client 再用這個路徑呼叫
+`add_attachment`——只有短路徑字串會進 token stream。
+
+整個工作流透過 MCP 協定自我描述，client 端**零安裝、零設定**：agent（如 Claude Code）呼叫
+`prepare_upload` 工具就拿到端點用法與短效 `upload_token`，接著自己上傳：
+
+```sh
+# upload_token 由 prepare_upload 簽發（server 未設 MCP_AUTH_TOKEN 時免帶 header）
+curl -fsS -F "file=@/local/invoice.png" \
+     -H "Authorization: Bearer <upload_token>" \
+     https://your-server:8000/upload
+# → {"file_path": "/shared/uploads/<uuid>.png", "file_name": "invoice.png"}
+```
+
+接著呼叫 `add_attachment(file_path="/shared/uploads/<uuid>.png", file_name="invoice.png", ...)`。
+不經 MCP 的手動整合（腳本、CI 等）也可以直接拿 `MCP_AUTH_TOKEN` 本體打同一個端點。
+
+安全機制：
+
+- `/upload` 是**會寫檔**的端點，設了 `MCP_AUTH_TOKEN` 就要求 Bearer token（custom route 不受 MCP 認證保護，故自行驗證）
+- `prepare_upload` 簽發的是 **HMAC 衍生短效 token**（`MCP_AUTH_TOKEN` 為根秘密簽出、預設 10 分鐘、只對 `/upload` 有效、無狀態驗證）——master token 不進 LLM context，就算對話 transcript 外流，外洩的也只是效期內的上傳權限
+- 磁碟檔名由 server 端 `uuid` 產生，client 給的檔名**絕不進入路徑**，無法逃出 `UPLOAD_DIR`
+- 單檔大小上限 `UPLOAD_MAX_BYTES`（預設 25 MiB），超過回 413
+- 不自動清理 `UPLOAD_DIR`，請搭配定期清理或使用 ephemeral volume
 
 ### 唯讀模式
 

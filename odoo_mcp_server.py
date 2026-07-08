@@ -13,6 +13,8 @@ Environment Variables:
         (optional; unset = no authentication, stdio is unaffected)
     UPLOAD_DIR: Directory that add_attachment's file_path mode is confined to
         (default: /shared/uploads). Set to "/" to allow any path.
+    UPLOAD_MAX_BYTES: Max bytes for a single POST to the /upload endpoint
+        (default: 25 MiB).
 """
 
 __version__ = "1.0.0"
@@ -20,9 +22,14 @@ __version__ = "1.0.0"
 import argparse
 import base64
 import functools
+import hashlib
+import hmac
 import json
 import os
+import secrets
 import sys
+import time
+import uuid
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -35,6 +42,8 @@ from fastmcp import FastMCP
 from fastmcp.dependencies import Depends
 from fastmcp.exceptions import ToolError
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
+from starlette.datastructures import UploadFile
+from starlette.formparsers import MultiPartException
 from starlette.responses import JSONResponse
 
 load_dotenv()
@@ -56,6 +65,12 @@ MCP_AUTH_TOKEN = os.getenv("MCP_AUTH_TOKEN")
 # 純本機 stdio 若要放行任意路徑，明確設 UPLOAD_DIR=/ 自行放寬。
 # （os.getenv(...) or ... 讓「未設」與「設為空字串」都落回預設，避免空字串 resolve 成 cwd。）
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR") or "/shared/uploads").resolve()
+
+# /upload 端點單一檔案的大小上限（bytes），擋 disk-fill。預設 25 MiB。
+UPLOAD_MAX_BYTES = int(os.getenv("UPLOAD_MAX_BYTES") or 25 * 1024 * 1024)
+
+# prepare_upload 簽發的短效 upload token 有效期（秒）。
+UPLOAD_TOKEN_TTL_SECONDS = 600
 
 
 # =============================================================================
@@ -361,6 +376,93 @@ mcp = FastMCP(
 async def health_check(request):
     """Health check endpoint for load balancers and monitoring."""
     return JSONResponse({"status": "healthy", "service": "odoo-mcp-server", "version": __version__})
+
+
+def _make_upload_token() -> str | None:
+    """從 MCP_AUTH_TOKEN 衍生短效 upload token（HMAC、自帶效期、無狀態）.
+
+    prepare_upload 的回傳值會進 LLM context（transcript、對話摘要都留得下來），
+    絕不能把 MCP_AUTH_TOKEN 本體交出去——那是整個 server 的 master key。改發衍生
+    token：外洩最多換到「效期內對 /upload 寫檔」的權限。格式
+    "<expiry_unix>.<hmac_sha256_hex>"，驗證只需重算 HMAC，server 不用保存任何狀態。
+    """
+    if not MCP_AUTH_TOKEN:
+        return None
+    expiry = str(int(time.time()) + UPLOAD_TOKEN_TTL_SECONDS)
+    sig = hmac.new(MCP_AUTH_TOKEN.encode(), expiry.encode(), hashlib.sha256).hexdigest()
+    return f"{expiry}.{sig}"
+
+
+def _verify_upload_token(token: str) -> bool:
+    """驗證 _make_upload_token 簽發的衍生 token：格式對、未過期、HMAC 相符."""
+    if not MCP_AUTH_TOKEN:
+        return False
+    expiry, _, sig = token.partition(".")
+    if not expiry.isdigit() or int(expiry) < time.time():
+        return False
+    expected = hmac.new(MCP_AUTH_TOKEN.encode(), expiry.encode(), hashlib.sha256).hexdigest()
+    return secrets.compare_digest(sig, expected)
+
+
+def _check_upload_auth(request) -> bool:
+    """/upload 收兩種 Bearer：MCP_AUTH_TOKEN 本體，或 prepare_upload 簽發的短效衍生
+    token（有設 MCP_AUTH_TOKEN 才驗，與 /mcp 一致；沒設＝不擋）.
+
+    custom route 不受 MCP 的 StaticTokenVerifier 保護（/health 就是靠這點免認證），
+    所以這個「會寫檔」的端點必須自己檢查 Bearer，否則等於開放任意人往主機寫檔。
+    """
+    if not MCP_AUTH_TOKEN:
+        return True
+    scheme, _, token = request.headers.get("authorization", "").partition(" ")
+    if scheme.lower() != "bearer":
+        return False
+    return secrets.compare_digest(token, MCP_AUTH_TOKEN) or _verify_upload_token(token)
+
+
+def _safe_suffix(filename: str) -> str:
+    """取原檔名的副檔名，僅接受短的 ASCII 英數（如 .png / .jpeg），否則回空字串.
+
+    僅供顯示/辨識用途——實際磁碟檔名由 uuid 產生，副檔名不參與路徑安全。
+    """
+    tail = Path(filename).suffix[1:]
+    if tail.isascii() and tail.isalnum() and len(tail) <= 10:
+        return "." + tail.lower()
+    return ""
+
+
+@mcp.custom_route("/upload", methods=["POST"])
+async def upload_file(request):
+    """Out-of-band 檔案上傳，給跨機器的 add_attachment file_path 模式用.
+
+    讓 client 用純 HTTP 把位元組直接推上來（不經 LLM token stream），server 存進
+    UPLOAD_DIR 後回傳 file_path；client 再拿這個 path 呼叫 add_attachment，只有短路徑
+    字串進 token stream。磁碟檔名由 uuid 產生，client 給的檔名絕不進入路徑，故無法逃出
+    UPLOAD_DIR。有設 MCP_AUTH_TOKEN 時要求 Bearer token：master token 或 prepare_upload
+    簽發的短效衍生 token 皆可（見 _check_upload_auth）。
+    """
+    if not _check_upload_auth(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+    content_length = request.headers.get("content-length", "")
+    if content_length.isdigit() and int(content_length) > UPLOAD_MAX_BYTES:
+        return JSONResponse({"error": f"File exceeds UPLOAD_MAX_BYTES ({UPLOAD_MAX_BYTES})."}, status_code=413)
+
+    try:
+        form = await request.form(max_part_size=UPLOAD_MAX_BYTES)
+    except MultiPartException:
+        return JSONResponse({"error": "Malformed or oversized multipart upload."}, status_code=400)
+
+    upload = form.get("file")
+    if not isinstance(upload, UploadFile):
+        return JSONResponse({"error": "Missing multipart 'file' field."}, status_code=400)
+
+    data = await upload.read()
+    original_name = upload.filename or "upload"
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    stored_path = UPLOAD_DIR / f"{uuid.uuid4().hex}{_safe_suffix(original_name)}"
+    stored_path.write_bytes(data)
+
+    return JSONResponse({"file_path": str(stored_path), "file_name": Path(original_name).name})
 
 
 # =============================================================================
@@ -860,6 +962,45 @@ def delete_record(
 
 @mcp.tool(tags={"write"})
 @handle_tool_errors
+def prepare_upload() -> str:
+    """
+    Prepare an out-of-band upload of a CLIENT-side file to this server.
+
+    Use this when the file to attach lives on the client machine and this MCP
+    server is remote: pushing the bytes over plain HTTP keeps them out of the
+    LLM token stream (much faster and cheaper than base64_data for large files).
+
+    Workflow:
+    1. Call this tool to get the endpoint info and a short-lived upload_token.
+    2. POST the file (multipart field 'file') to <origin>/upload, where
+       <origin> is the same scheme://host:port this MCP connection uses:
+       curl -fsS -F "file=@/local/invoice.png" \\
+            -H "Authorization: Bearer <upload_token>" <origin>/upload
+       -> {"file_path": "/shared/uploads/<uuid>.png", "file_name": "invoice.png"}
+    3. Call add_attachment(file_path=..., file_name=..., res_model=..., res_id=...).
+
+    Returns:
+        JSON string with endpoint, method, upload_token (null when the server
+        has no MCP_AUTH_TOKEN configured — omit the Authorization header in
+        that case), expires_in_seconds, and max_bytes.
+    """
+    token = _make_upload_token()
+    return json.dumps(
+        {
+            "endpoint": "/upload",
+            "base_url_hint": "Use the same scheme://host:port as this MCP connection.",
+            "method": "POST multipart/form-data, file field name 'file'",
+            "upload_token": token,
+            "expires_in_seconds": UPLOAD_TOKEN_TTL_SECONDS if token else None,
+            "max_bytes": UPLOAD_MAX_BYTES,
+            "next_step": ("POST the file to obtain file_path, then call add_attachment(file_path=..., file_name=...)."),
+        },
+        indent=2,
+    )
+
+
+@mcp.tool(tags={"write"})
+@handle_tool_errors
 def add_attachment(
     file_path: str | None = None,
     base64_data: str | None = None,
@@ -875,7 +1016,9 @@ def add_attachment(
     Supports two input modes:
     - file_path: Read a local file from the MCP server's filesystem. The path
       must resolve to a location inside UPLOAD_DIR (default /shared/uploads);
-      paths outside it are refused.
+      paths outside it are refused. If the file lives on the CLIENT machine
+      and this server is remote, call prepare_upload first and POST the file
+      to /upload to obtain a server-side file_path.
     - base64_data + file_name: Pass file content directly as base64 string.
       Use this when the file is not on disk (e.g., image uploaded via Discord).
 
@@ -886,7 +1029,9 @@ def add_attachment(
         base64_data: File content as a base64-encoded string.
                      Mutually exclusive with file_path.
         file_name: Filename for the attachment (e.g., 'invoice.png').
-                   Required when using base64_data. Ignored when file_path is provided.
+                   Required with base64_data; optional with file_path (defaults to
+                   the file's own name — handy to restore a real name when file_path
+                   points at a server-generated /upload name).
         res_model: Model to attach to (e.g., 'account.move'). None for standalone attachment.
         res_id: Record ID to attach to. Required if res_model is provided.
         description: Optional description for the attachment.
@@ -908,7 +1053,7 @@ def add_attachment(
         if not path.is_file():
             raise ToolError(f"File not found: {file_path}")
         file_data = base64.b64encode(path.read_bytes()).decode("ascii")
-        name = path.name
+        name = file_name or path.name
         file_size = path.stat().st_size
     else:
         if not file_name:

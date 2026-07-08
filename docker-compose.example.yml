@@ -5,18 +5,18 @@
 #   cp docker-compose.example.yml docker-compose.yml  # 依需求調整
 #   docker compose up -d
 #
-# 注意：此範本「不是」up 完即可運作的完整堆疊。
-# 圖片 / 附件傳遞流程需要「另一端」（MCP client + 上傳圖片的服務），
-# 它必須掛載同一個 shared-uploads volume，並連線 http://odoo-mcp:8000/mcp。
-# 見下方註解掉的 your-client 服務。
+# 圖片 / 附件傳遞流程需要「另一端」（MCP client）連上 http://odoo-mcp:8000/mcp
+# 並把檔案送進 server，依部署拓撲二擇一：
 #
-# 重要前提：shared-uploads 是 Docker named volume，只能在「同一台 Docker host」
-# 的容器之間共享。唯有 client 與 odoo-mcp 同主機（例如同一個 compose）時，
-# client 才能把檔案寫進 volume，讓 server 用 add_attachment 的 file_path 模式
-# （路徑在 /shared/uploads/...）讀取。
-# 若 client 在「另一台機器」透過網路呼叫遠端 server，雙方無法共用此 volume，
-# 只能改用 add_attachment 的 base64_data 模式傳檔（base64 體積膨脹約 33%，
-# 不適合過大的檔案）。
+# 1) client 與 odoo-mcp 在「同一台 Docker host」（例如同一個 compose）：
+#    兩邊掛載同一個 shared-uploads volume，client 把檔案寫進 /shared/uploads，
+#    server 再用 add_attachment 的 file_path 模式（路徑在 /shared/uploads/...）讀取。
+#    （shared-uploads 是 Docker named volume，只能在同一台 host 的容器之間共享。）
+#
+# 2) client 在「另一台機器」透過網路呼叫遠端 server：雙方無法共用此 volume。
+#    改走 prepare_upload → /upload 端點，把檔案 out-of-band（普通 HTTP POST、不經 LLM）
+#    推到 server，server 存進 UPLOAD_DIR 後回傳 file_path 給 add_attachment，
+#    詳見 README「安全機制」。檔案不在磁碟上（如 Discord 圖片）則用 base64_data 模式。
 
 volumes:
   shared-uploads:
@@ -43,10 +43,12 @@ services:
       # 對應下方掛載的 shared-uploads volume，故此處免設即可運作）。
       # 設為 / 等於解除限制、放行任意路徑，自負風險。
       # - UPLOAD_DIR=/shared/uploads
+      # /upload 端點單一檔案大小上限（bytes），超過回 413。預設 25 MiB。
+      # - UPLOAD_MAX_BYTES=26214400
       # HTTP 模式的 Host 標頭防護（DNS rebinding protection，來自底層 MCP SDK）：
       # 用非 localhost 的 IP／網域連進來時，預設會被擋下並回 "Invalid host header"。
       # ⚠️ 快速測試可先全開（等於對任何 Host 開放，切勿用於正式環境）：
-      #   - FASTMCP_HTTP_ALLOWED_HOSTS=["*"]
+      - FASTMCP_HTTP_ALLOWED_HOSTS=["*"]
       # ✅ 正規做法：只列出 client 實際連線的 host（含 port）。純 IP 部署：
       #   - FASTMCP_HTTP_ALLOWED_HOSTS=["your-server-ip:8000"]
       # 反向代理／網域對外（建議搭配 TLS）：
