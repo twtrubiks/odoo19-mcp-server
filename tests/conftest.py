@@ -11,3 +11,4 @@ import os
 os.environ["MCP_MULTIUSER"] = "false"
 os.environ["MCP_AUTH_TOKEN"] = ""  # 空字串 falsy，等同未設定
 os.environ["UPLOAD_TOKEN_SECRET"] = ""
+os.environ["MCP_ALLOW_SENSITIVE_MODELS"] = "false"  # 模型黑名單測試假設預設啟用

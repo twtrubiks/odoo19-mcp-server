@@ -29,9 +29,11 @@ from odoo_mcp_server import (
     create_record,
     delete_record,
     execute_method,
+    get_record,
     handle_tool_errors,
     prepare_upload,
     resolve_upload_path,
+    search_records,
 )
 
 # =============================================================================
@@ -333,6 +335,60 @@ class TestExecuteMethodUnlinkBlock:
         )
         assert result == 42
         mock_client.execute.assert_called_once()
+
+
+# =============================================================================
+# 5.2 模型黑名單 — credential 模型讀寫全擋（confused deputy 防線）
+# =============================================================================
+
+
+class TestModelBlacklist:
+    """測試 check_model_access 黑名單在各入口的接線."""
+
+    def test_blocks_search(self):
+        """ir.config_parameter 存各種第三方 secret，連讀都要擋."""
+        mock_client = MagicMock()
+        with pytest.raises(ToolError, match="blocked"):
+            search_records(model="ir.config_parameter", client=mock_client)
+        mock_client.search_read.assert_not_called()
+
+    def test_blocks_apikey_generate(self):
+        """CRITICAL：execute_method 不能在 res.users.apikeys 上鑄新 key（後門）."""
+        mock_client = MagicMock()
+        with pytest.raises(ToolError, match="blocked"):
+            execute_method(model="res.users.apikeys", method="generate", client=mock_client)
+        mock_client.execute.assert_not_called()
+
+    def test_blocks_resource_read(self):
+        """odoo://record resource 也是讀取入口，不能漏."""
+        mock_client = MagicMock()
+        with pytest.raises(ToolError, match="blocked"):
+            get_record(model_name="ir.config_parameter", record_id=1, client=mock_client)
+        mock_client.read.assert_not_called()
+
+    def test_blocks_create(self):
+        """寫入入口也要擋：不能經 create_record 種 config parameter."""
+        mock_client = MagicMock()
+        with pytest.raises(ToolError, match="blocked"):
+            create_record(model="ir.config_parameter", values={"key": "x", "value": "y"}, client=mock_client)
+        mock_client.create.assert_not_called()
+
+    def test_non_blacklisted_model_allowed(self):
+        """黑名單外的模型正常放行（res.users 等安全模型的授權交由 Odoo ACL）."""
+        mock_client = MagicMock()
+        mock_client.search_read.return_value = [{"id": 2, "name": "Bob"}]
+        mock_client.search_count.return_value = 1
+        result = json.loads(search_records(model="res.users", fields=["name"], client=mock_client))
+        assert result["records"][0]["id"] == 2
+
+    def test_escape_hatch_disables_blacklist(self, monkeypatch):
+        """MCP_ALLOW_SENSITIVE_MODELS=true → 黑名單整組停用."""
+        monkeypatch.setattr("odoo_mcp_server.MCP_ALLOW_SENSITIVE_MODELS", True)
+        mock_client = MagicMock()
+        mock_client.search_read.return_value = []
+        mock_client.search_count.return_value = 0
+        result = json.loads(search_records(model="ir.config_parameter", fields=["key"], client=mock_client))
+        assert result["total"] == 0
 
 
 # =============================================================================

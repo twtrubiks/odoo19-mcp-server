@@ -120,6 +120,7 @@ def get_current_user():
 | `ODOO_DATABASE` | 資料庫名稱 | - |
 | `ODOO_API_KEY` | API Key 認證 | - |
 | `READONLY_MODE` | 唯讀模式（禁止寫入操作） | `false` |
+| `MCP_ALLOW_SENSITIVE_MODELS` | 設 `true` 停用[模型黑名單](#模型黑名單mcp_allow_sensitive_models)（預設擋 credential 模型 `ir.config_parameter`、`res.users.apikeys` 的讀寫） | `false` |
 | `MCP_AUTH_TOKEN` | HTTP/SSE 模式的 Bearer Token 認證（未設定＝無認證；stdio 不適用），見[安全機制](#安全機制) | -（停用） |
 | `MCP_MULTIUSER` | 多 user 模式：每個 client 拿**自己的 Odoo API key** 當 Bearer token，見[安全機制](#安全機制) | `false` |
 | `UPLOAD_TOKEN_SECRET` | upload token 的 HMAC secret；僅多 worker 部署需要設定（單一程序自動衍生） | - |
@@ -323,7 +324,7 @@ server 未啟用 `MCP_AUTH_TOKEN`、也未開多 user 模式時，`headers` 整�
 | `create_record` | 建立記錄 | No |
 | `update_record` | 更新記錄 | No |
 | `delete_record` | 刪除記錄（需二次確認） | No |
-| `execute_method` | 執行任意模型方法（萬用入口，`unlink` 已封鎖，見[安全機制](#安全機制)） | No |
+| `execute_method` | 執行任意模型方法（萬用入口，`unlink` 與黑名單模型已封鎖，見[安全機制](#安全機制)） | No |
 | `add_attachment` | 上傳附件到 Odoo（`file_path` / `base64_data` 兩種模式，見[安全機制](#安全機制)） | No |
 | `prepare_upload` | 取得 `/upload` 端點用法與短效 `upload_token`（跨機器傳檔，見[安全機制](#安全機制)） | No |
 
@@ -708,6 +709,19 @@ curl -fsS -F "file=@/local/invoice.png" \
 - 單檔大小上限 `UPLOAD_MAX_BYTES`（預設 25 MiB），超過回 413
 - 不自動清理 `UPLOAD_DIR`，請搭配定期清理或使用 ephemeral volume
 
+### 模型黑名單（`MCP_ALLOW_SENSITIVE_MODELS`）
+
+預設封鎖以下兩個機密模型的**所有讀寫**，防範 prompt injection——LLM 讀到藏在資料裡的惡意指令，拿著你的 API key 做出「權限上合法、但你沒要求」的操作：
+
+- `ir.config_parameter`：存第三方 API key、webhook token 等機密，一句 search 就全外洩
+- `res.users.apikeys`：可產生新的長效 API key——事後 rotate 原 key 也擋不住，等於留後門
+
+正常的 agent 工作流程用不到這兩個模型，封鎖不影響日常使用；所有工具與 Resources（含 `execute_method`）都會檢查。
+
+> 黑名單只是多一層保險，**不是權限控管**——權限仍由 Odoo ACL 決定，請給 MCP 低權限使用者的 API key
+> （`res.users`、`ir.rule` 等安全模型因此不在黑名單內）。
+> 真的需要透過 MCP 管理這兩個模型時，設 `MCP_ALLOW_SENSITIVE_MODELS=true` 停用。
+
 ### 唯讀模式
 
 設定 `READONLY_MODE=true` 啟用唯讀模式，適用於生產環境查詢：
@@ -725,6 +739,7 @@ curl -fsS -F "file=@/local/invoice.png" \
 `execute_method` 是萬用入口（escape hatch），用來呼叫沒有專用工具的模型方法，請理解其風險：
 
 - ORM 原語 `unlink` 已被攔下，會導向 `delete_record` 的二次確認流程，無法藉此繞過確認
+- [模型黑名單](#模型黑名單mcp_allow_sensitive_models)同樣適用：credential 模型（`ir.config_parameter`、`res.users.apikeys`）全擋
 - 但 `action_confirm`、`action_post`、`button_validate` 這類會改資料的**業務方法不設防**——
   Odoo 有上千個模型方法，server 無法枚舉哪些會寫入資料庫
 - 真正的安全邊界應該是給 MCP 使用**低權限的 Odoo 使用者** API key（最小權限原則）

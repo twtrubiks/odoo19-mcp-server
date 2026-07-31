@@ -9,6 +9,9 @@ Environment Variables:
     ODOO_DATABASE: Database name (default: odoo)
     ODOO_API_KEY: API key for authentication
     READONLY_MODE: Set to "true" to disable write operations (default: false)
+    MCP_ALLOW_SENSITIVE_MODELS: Set to "true" to disable the model blacklist
+        (blocks credential-bearing models entirely;
+        default: false, see DENY_ALL_MODELS)
     MCP_AUTH_TOKEN: Bearer token for HTTP/SSE transport authentication
         (optional; unset = no authentication, stdio is unaffected)
     MCP_MULTIUSER: Set to "true" to let each client authenticate with their
@@ -71,6 +74,7 @@ ODOO_DATABASE = os.getenv("ODOO_DATABASE", "your_database_key_here")
 _ODOO_API_KEY_PLACEHOLDER = "your_api_key_here"
 ODOO_API_KEY = os.getenv("ODOO_API_KEY", _ODOO_API_KEY_PLACEHOLDER)
 READONLY_MODE = os.getenv("READONLY_MODE", "false").lower() == "true"
+MCP_ALLOW_SENSITIVE_MODELS = os.getenv("MCP_ALLOW_SENSITIVE_MODELS", "false").lower() == "true"
 MCP_AUTH_TOKEN = os.getenv("MCP_AUTH_TOKEN")
 
 # 多 user 模式：HTTP/SSE 的 Bearer token 改收「各 user 自己的 Odoo API key」，
@@ -148,6 +152,33 @@ def check_readonly_mode(operation: str) -> None:
         raise ToolError(
             f"Operation '{operation}' is not allowed in READONLY_MODE. "
             "Set READONLY_MODE=false to enable write operations."
+        )
+
+
+# 模型黑名單（defense-in-depth，非授權機制）：防 prompt injection 下的 confused
+# deputy——LLM 拿著 API key 做「權限上合法、但使用者沒要求」的事。只擋 credential
+# 模型：ir.config_parameter 存第三方 secret，一句 search 就全外洩；res.users.apikeys
+# 可鑄出新的長效 API key（等於留後門），故讀寫全擋。res.users、ir.rule 等安全設定
+# 模型的授權交由 Odoo ACL 把關。MCP_ALLOW_SENSITIVE_MODELS=true 可停用。
+DENY_ALL_MODELS = frozenset(
+    {
+        "ir.config_parameter",
+        "res.users.apikeys",
+        "res.users.apikeys.description",  # 產 key 的 wizard，同屬鑄造路徑
+    }
+)
+
+
+def check_model_access(model: str) -> None:
+    """模型黑名單檢查（理由見上方 DENY_ALL_MODELS 註解）."""
+    if MCP_ALLOW_SENSITIVE_MODELS:
+        return
+    if model in DENY_ALL_MODELS:
+        raise ToolError(
+            f"Model '{model}' is blocked by this MCP server: it stores or mints "
+            "credentials, and no agent workflow legitimately needs it. Use the "
+            "Odoo web interface instead, or set MCP_ALLOW_SENSITIVE_MODELS=true "
+            "to disable this safeguard."
         )
 
 
@@ -734,6 +765,7 @@ def list_models_resource(client: OdooJsonRpcClient = Depends(get_caller_client))
 @mcp.resource("odoo://model/{model_name}")
 def get_model_fields(model_name: str, client: OdooJsonRpcClient = Depends(get_caller_client)) -> str:
     """Get field information for a specific model using ORM fields_get()."""
+    check_model_access(model_name)
     # 使用 fields_get() 取得更完整的欄位資訊
     fields_data = client.fields_get(
         model_name,
@@ -767,6 +799,7 @@ def get_model_fields(model_name: str, client: OdooJsonRpcClient = Depends(get_ca
 @mcp.resource("odoo://record/{model_name}/{record_id}")
 def get_record(model_name: str, record_id: int, client: OdooJsonRpcClient = Depends(get_caller_client)) -> str:
     """Get a single record by ID (auto-excludes dangerous fields like binary/image/html)."""
+    check_model_access(model_name)
     # 自動排除危險欄位（binary、image、html）
     fields = get_safe_fields(client, model_name)
     records = client.read(model_name, [int(record_id)], fields=fields)
@@ -888,6 +921,8 @@ def get_fields(
         - selection: List of [value, label] pairs (for selection fields)
         - comodel_name: Related model name (for relational fields)
     """
+    check_model_access(model)
+
     # 使用預設屬性或自訂屬性
     attrs = attributes or DEFAULT_FIELD_ATTRIBUTES
 
@@ -923,10 +958,10 @@ def execute_method(
     """
     Execute any method on an Odoo model (general-purpose escape hatch).
 
-    WARNING: This tool is NOT guarded by this server. Business methods
-    (e.g. action_confirm, action_post, button_validate, toggle_active)
-    can modify or irreversibly change data in Odoo. Before calling any
-    method that changes state, make sure the user explicitly asked for it.
+    WARNING: Business methods (e.g. action_confirm, action_post,
+    button_validate, toggle_active) can modify or irreversibly change data
+    in Odoo and are NOT guarded by this server. Before calling any method
+    that changes state, make sure the user explicitly asked for it.
 
     Args:
         model: Model name (e.g., 'res.partner')
@@ -940,6 +975,8 @@ def execute_method(
     Note:
         - 'unlink' is blocked here. Use the delete_record tool instead,
           which enforces a user confirmation step.
+        - Credential models (ir.config_parameter, res.users.apikeys) are
+          fully blocked. See check_model_access.
         - In READONLY_MODE, write tools are disabled at the module level
           (hidden from LLM and direct calls are rejected).
     """
@@ -949,6 +986,7 @@ def execute_method(
             "Use the 'delete_record' tool instead, which requires "
             "user confirmation before irreversible deletion."
         )
+    check_model_access(model)
     check_readonly_mode(method)
     args = args or []
     kwargs = kwargs or {}
@@ -987,6 +1025,7 @@ def search_records(
         JSON with records, total count, limit, and offset.
         Each record includes a '_url' field for direct browser access.
     """
+    check_model_access(model)
     domain = domain or []
 
     # 當 fields=None 時，自動排除危險欄位（binary、image、html）
@@ -1032,6 +1071,7 @@ def count_records(
     Returns:
         JSON string with the count
     """
+    check_model_access(model)
     domain = domain or []
     count = client.search_count(model, domain)
     return json.dumps({"model": model, "count": count}, indent=2)
@@ -1057,6 +1097,7 @@ def read_records(
         JSON string with the records. Each record includes a '_url' field
         for direct browser access to that record.
     """
+    check_model_access(model)
     # 當 fields=None 時，自動排除危險欄位（binary、image、html）
     if fields is None:
         fields = get_safe_fields(client, model)
@@ -1096,6 +1137,7 @@ def create_record(
         In READONLY_MODE, this tool is disabled at registration time
         (hidden from LLM and direct calls are rejected).
     """
+    check_model_access(model)
     result = client.create(model, values)
     if isinstance(values, list):
         ids = result if isinstance(result, list) else [result]
@@ -1147,6 +1189,7 @@ def update_record(
         In READONLY_MODE, this tool is disabled at registration time
         (hidden from LLM and direct calls are rejected).
     """
+    check_model_access(model)
     result = client.write(model, ids, values)
 
     if result:
@@ -1192,6 +1235,7 @@ def delete_record(
     Returns:
         JSON string with success status or pending confirmation
     """
+    check_model_access(model)
     if not confirm:
         return json.dumps(
             {
