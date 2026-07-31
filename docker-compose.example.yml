@@ -39,6 +39,9 @@ services:
       - READONLY_MODE=${READONLY_MODE:-false}
       # HTTP 模式的 Bearer Token 認證（未設定＝無認證，見 README「安全機制」）
       - MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN:-}
+      # 多 user 模式：每個 client 拿自己的 Odoo API key 當 Bearer token，
+      # 權限/審計歸屬真實 user（見 README「多 user 模式」）。
+      # - MCP_MULTIUSER=true
       # add_attachment 的 file_path 僅允許讀取 UPLOAD_DIR 底下的檔案（預設 /shared/uploads，
       # 對應下方掛載的 shared-uploads volume，故此處免設即可運作）。
       # 設為 / 等於解除限制、放行任意路徑，自負風險。

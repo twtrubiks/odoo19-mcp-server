@@ -11,6 +11,11 @@ Environment Variables:
     READONLY_MODE: Set to "true" to disable write operations (default: false)
     MCP_AUTH_TOKEN: Bearer token for HTTP/SSE transport authentication
         (optional; unset = no authentication, stdio is unaffected)
+    MCP_MULTIUSER: Set to "true" to let each client authenticate with their
+        OWN Odoo API key as the Bearer token (verified against Odoo, cached).
+        MCP_AUTH_TOKEN keeps working as an admin fallback. (default: false)
+    UPLOAD_TOKEN_SECRET: HMAC secret for prepare_upload tokens. Only needed
+        for multi-worker deployments; single process derives one automatically.
     UPLOAD_DIR: Directory that add_attachment's file_path mode is confined to
         (default: /shared/uploads). Set to "/" to allow any path.
     UPLOAD_MAX_BYTES: Max bytes for a single POST to the /upload endpoint
@@ -20,6 +25,7 @@ Environment Variables:
 __version__ = "1.0.0"
 
 import argparse
+import asyncio
 import base64
 import functools
 import hashlib
@@ -28,6 +34,7 @@ import json
 import os
 import secrets
 import sys
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -36,12 +43,16 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+import httpx
 import odoolib
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 from fastmcp.dependencies import Depends
 from fastmcp.exceptions import ToolError
+from fastmcp.server.auth import AccessToken, TokenVerifier
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
+from fastmcp.server.dependencies import get_access_token
+from odoolib.tools import AuthenticationError
 from starlette.datastructures import UploadFile
 from starlette.formparsers import MultiPartException
 from starlette.responses import JSONResponse
@@ -54,9 +65,26 @@ load_dotenv()
 
 ODOO_URL = os.getenv("ODOO_URL", "http://localhost:8069")
 ODOO_DATABASE = os.getenv("ODOO_DATABASE", "your_database_key_here")
-ODOO_API_KEY = os.getenv("ODOO_API_KEY", "your_api_key_here")
+
+# 純多 user 部署（MCP_MULTIUSER=true、不設 MCP_AUTH_TOKEN、不跑 stdio）可不設
+# ODOO_API_KEY——fallback 路徑不會被走到，server 端就沒有任何長效憑證可外洩。
+_ODOO_API_KEY_PLACEHOLDER = "your_api_key_here"
+ODOO_API_KEY = os.getenv("ODOO_API_KEY", _ODOO_API_KEY_PLACEHOLDER)
 READONLY_MODE = os.getenv("READONLY_MODE", "false").lower() == "true"
 MCP_AUTH_TOKEN = os.getenv("MCP_AUTH_TOKEN")
+
+# 多 user 模式：HTTP/SSE 的 Bearer token 改收「各 user 自己的 Odoo API key」，
+# 驗證直接問 Odoo（見 Multi-user Authentication 一節）。MCP_AUTH_TOKEN 可並存，
+# 作為 admin fallback（走 env 憑證的共享 client）。
+MCP_MULTIUSER = os.getenv("MCP_MULTIUSER", "false").lower() == "true"
+
+# upload token 的 HMAC secret 覆寫。單一程序不用設（會自動 fallback，見
+# _upload_token_secret）；多 worker 部署各程序要簽驗同一把才需要明確設定。
+UPLOAD_TOKEN_SECRET = os.getenv("UPLOAD_TOKEN_SECRET")
+
+# 程序啟動時生成的 fallback secret：多 user 模式沒設 UPLOAD_TOKEN_SECRET /
+# MCP_AUTH_TOKEN 時用。重啟即換新——upload token 本來就只有短效期，可接受。
+_RUNTIME_UPLOAD_SECRET = secrets.token_bytes(32)
 
 # add_attachment 的 file_path 模式會讀 MCP 主機的本地檔案，是本 server 唯一的
 # 本機檔案讀取原語。若不設限，被 prompt injection 的 LLM 可用 file_path="/app/.env"
@@ -199,7 +227,14 @@ def get_safe_fields(client: "OdooJsonRpcClient", model: str) -> list[str]:
 
 @dataclass
 class OdooJsonRpcClient:
-    """Wrapper for odoolib connection using JSON-RPC (json2) protocol."""
+    """Wrapper for odoolib connection using JSON-RPC (json2) protocol.
+
+    所有對 model proxy 的呼叫一律使用 kwargs（含 record ids 也走 ids=...）：
+    odoolib 只要收到 positional args 就會先打 /doc-bearer/{model}.json 內省
+    方法簽名，而該路由需要 Odoo 的 Technical Documentation 群組
+    (api_doc.group_allow_doc)，一般使用者沒有，會直接 403。
+    kwargs 名稱必須對應 Odoo ORM 方法簽名（如 create 的 vals_list、write 的 vals）。
+    """
 
     connection: Any
 
@@ -222,7 +257,7 @@ class OdooJsonRpcClient:
             hostname=host,
             port=port,
             database=database,
-            login="api",  # Using API key auth
+            login="api",  # json2 protocol 忽略 login，API key 即完整憑證（Odoo 從 key 解析 user）
             password=api_key,
             protocol=protocol,
         )
@@ -235,12 +270,12 @@ class OdooJsonRpcClient:
     def search(self, model: str, domain: list, limit: int = 100, offset: int = 0) -> list[int]:
         """Search for records matching the domain."""
         model_proxy = self.get_model(model)
-        return model_proxy.search(domain, limit=limit, offset=offset)
+        return model_proxy.search(domain=domain, limit=limit, offset=offset)
 
     def search_count(self, model: str, domain: list) -> int:
         """Count records matching the domain."""
         model_proxy = self.get_model(model)
-        return model_proxy.search_count(domain)
+        return model_proxy.search_count(domain=domain)
 
     def read(self, model: str, ids: list[int], fields: list[str] | None = None) -> list[dict]:
         """Read records by IDs.
@@ -249,7 +284,7 @@ class OdooJsonRpcClient:
         This method normalizes the result to always return a list.
         """
         model_proxy = self.get_model(model)
-        result = model_proxy.read(ids, fields) if fields else model_proxy.read(ids)
+        result = model_proxy.read(ids=ids, fields=fields) if fields else model_proxy.read(ids=ids)
 
         # Normalize result: odoolib returns dict for single ID, list for multiple
         if isinstance(result, dict):
@@ -272,27 +307,43 @@ class OdooJsonRpcClient:
             kwargs["fields"] = fields
         if order:
             kwargs["order"] = order
-        return model_proxy.search_read(domain, **kwargs)
+        return model_proxy.search_read(domain=domain, **kwargs)
 
     def create(self, model: str, values: dict | list[dict]) -> int | list[int]:
         """Create new record(s). Supports single dict or list of dicts for batch creation."""
         model_proxy = self.get_model(model)
-        return model_proxy.create(values)
+        return model_proxy.create(vals_list=values)
 
     def write(self, model: str, ids: list[int], values: dict) -> bool:
         """Update existing records."""
         model_proxy = self.get_model(model)
-        return model_proxy.write(ids, values)
+        return model_proxy.write(ids=ids, vals=values)
 
     def unlink(self, model: str, ids: list[int]) -> bool:
         """Delete records."""
         model_proxy = self.get_model(model)
-        return model_proxy.unlink(ids)
+        return model_proxy.unlink(ids=ids)
 
     def execute(self, model: str, method: str, *args, **kwargs) -> Any:
-        """Execute any method on a model."""
+        """Execute any method on a model.
+
+        傳 positional args 時仍會觸發 odoolib 的 /doc-bearer 內省
+        （任意 method 無從得知參數名，這裡避不掉），故將該路由的
+        403 翻譯成可行動的錯誤訊息。
+        """
         model_proxy = self.get_model(model)
-        return getattr(model_proxy, method)(*args, **kwargs)
+        try:
+            return getattr(model_proxy, method)(*args, **kwargs)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 403 and "/doc-bearer/" in str(e.request.url):
+                raise PermissionError(
+                    f"Cannot call '{model}.{method}' with positional args: your Odoo "
+                    "user lacks the 'Technical Documentation' group "
+                    "(api_doc.group_allow_doc), which odoolib needs to introspect "
+                    "method signatures. Either pass arguments as kwargs (named "
+                    "parameters), or ask an Odoo admin to grant you that group."
+                ) from e
+            raise
 
     def fields_get(
         self,
@@ -328,6 +379,123 @@ class OdooJsonRpcClient:
 
 
 # =============================================================================
+# Multi-user Authentication (pass-through)
+# =============================================================================
+
+# 多 user 模式（MCP_MULTIUSER=true）的設計：每個 user 拿「自己的 Odoo API key」
+# 當 HTTP/SSE 的 Bearer token。json2 protocol 的憑證只有 API key（login 參數被
+# odoolib 忽略），Odoo 端會從 key 解析出擁有者，所以 server 完全不需要保存任何
+# 使用者資料——驗證就是拿這把 key 問 Odoo 一次（結果快取 _VERIFY_TTL_SECONDS）。
+# 權限、審計、撤銷全部交給 Odoo 原生機制：ACL / record rules 依真實 user 生效，
+# chatter 歸屬正確，撤銷 = 在 Odoo 刪掉該 API key（最遲快取過期後失效）。
+
+ENV_ADMIN_CLIENT_ID = "odoo-mcp-client"
+
+_VERIFY_TTL_SECONDS = 300.0  # 驗證成功的快取效期；也是撤銷 API key 的最大延遲
+_VERIFY_NEG_TTL_SECONDS = 30.0  # 驗證失敗的快取效期：擋住拿 /mcp 當暴力破解跳板
+_NEG_CACHE_MAX = 1024  # 負快取筆數上限：防惡意灌不同亂 key 撐爆記憶體
+
+
+@dataclass
+class _UserEntry:
+    """一個已驗證 user 的專屬連線與身分（以 sha256(api_key) 為快取 key）."""
+
+    client: OdooJsonRpcClient
+    client_id: str
+    claims: dict[str, Any]
+    checked_at: float
+
+
+_user_cache: dict[str, _UserEntry] = {}
+_neg_cache: dict[str, float] = {}
+_user_cache_lock = threading.Lock()
+
+
+def _safe_get_access_token() -> AccessToken | None:
+    """目前呼叫者的 FastMCP access token；stdio / 無 auth context 回 None."""
+    try:
+        return get_access_token()
+    except Exception:
+        return None
+
+
+def _authenticate_odoo_token(api_key: str) -> _UserEntry | None:
+    """拿 API key 問 Odoo 驗證身分，成功回該 user 的專屬 client（帶 TTL 快取）.
+
+    只有「Odoo 明確拒絕」（401 / 無 uid）會進負快取；網路錯誤等暫時性例外
+    不快取，避免 Odoo 短暫不可用時把合法 key 鎖在門外。
+    """
+    cache_key = hashlib.sha256(api_key.encode()).hexdigest()
+    now = time.monotonic()
+    with _user_cache_lock:
+        entry = _user_cache.get(cache_key)
+        if entry is not None and now - entry.checked_at < _VERIFY_TTL_SECONDS:
+            return entry
+        rejected_at = _neg_cache.get(cache_key)
+        if rejected_at is not None and now - rejected_at < _VERIFY_NEG_TTL_SECONDS:
+            return None
+
+    client = OdooJsonRpcClient.connect(ODOO_URL, ODOO_DATABASE, api_key)
+    try:
+        uid = client.get_current_uid()
+    except AuthenticationError:
+        uid = None
+    except Exception:
+        return None  # Odoo 不可用等暫時性錯誤：不進負快取，下個請求重試
+    if uid is None:
+        with _user_cache_lock:
+            # key 已被 Odoo 明確拒絕（撤銷）：把殘留的舊 entry 一併清掉
+            _user_cache.pop(cache_key, None)
+            if len(_neg_cache) >= _NEG_CACHE_MAX:
+                # 先清已過期的；仍滿則丟最舊的（dict 保插入序）。不能整鍋 clear()：
+                # 那等於讓攻擊者灌滿亂 key 就重置所有失敗 key 的 30 秒鎖定
+                for stale in [k for k, t in _neg_cache.items() if now - t >= _VERIFY_NEG_TTL_SECONDS]:
+                    del _neg_cache[stale]
+                while len(_neg_cache) >= _NEG_CACHE_MAX:
+                    _neg_cache.pop(next(iter(_neg_cache)))
+            # 先 pop 再寫入，讓重複被拒的 key 移到隊尾，維持插入序＝時間序
+            _neg_cache.pop(cache_key, None)
+            _neg_cache[cache_key] = now
+        return None
+
+    try:
+        record = client.read("res.users", [uid], ["login", "name"])[0]
+        login = record.get("login") or f"uid-{uid}"
+        name = record.get("name") or ""
+    except Exception:
+        # 身分補充資訊拿不到不影響認證結果（uid 已驗證成功）
+        login, name = f"uid-{uid}", ""
+
+    entry = _UserEntry(
+        client=client,
+        client_id=login,
+        claims={"uid": uid, "name": name, "auth": "odoo-api-key"},
+        checked_at=now,
+    )
+    with _user_cache_lock:
+        # _user_cache 只有合法 key 進得來，撐不爆；但換過 key 的舊 entry 會
+        # 永遠殘留（過期後不會被讀到、也沒人刪），寫入時順手清掉
+        for stale in [k for k, e in _user_cache.items() if now - e.checked_at >= _VERIFY_TTL_SECONDS]:
+            del _user_cache[stale]
+        _user_cache[cache_key] = entry
+    return entry
+
+
+class OdooPassthroughVerifier(TokenVerifier):
+    """Bearer = 呼叫者自己的 Odoo API key；MCP_AUTH_TOKEN（若有設）仍可用，對應共享 env client."""
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        # 以 bytes 比較：str 版的 compare_digest 遇非 ASCII 會丟 TypeError（惡意輸入可觸發 500）
+        if MCP_AUTH_TOKEN and secrets.compare_digest(token.encode(), MCP_AUTH_TOKEN.encode()):
+            return AccessToken(token=token, client_id=ENV_ADMIN_CLIENT_ID, scopes=[], claims={"auth": "static"})
+        # Odoo RPC 是同步呼叫，丟到 thread 避免卡住 event loop
+        entry = await asyncio.to_thread(_authenticate_odoo_token, token)
+        if entry is None:
+            return None
+        return AccessToken(token=token, client_id=entry.client_id, scopes=[], claims=entry.claims)
+
+
+# =============================================================================
 # MCP Server Setup
 # =============================================================================
 
@@ -335,25 +503,75 @@ class OdooJsonRpcClient:
 _client: OdooJsonRpcClient | None = None
 
 
-def get_shared_client() -> OdooJsonRpcClient:
-    """取得共享的 Odoo 客戶端（單例模式）
+def _env_api_key_missing() -> bool:
+    """ODOO_API_KEY 沒真的設定（空值或還是 placeholder）→ fallback 身分不可用."""
+    return not ODOO_API_KEY or ODOO_API_KEY == _ODOO_API_KEY_PLACEHOLDER
 
-    連線只會在首次呼叫時建立，之後重複使用同一連線。
+
+def get_caller_client() -> OdooJsonRpcClient:
+    """取得目前呼叫者的 Odoo 客戶端.
+
+    多 user 模式下，已認證的一般 user 拿到「綁自己 API key」的專屬連線
+    （Odoo 端權限與審計因此歸屬真實 user）；stdio、env-admin（MCP_AUTH_TOKEN）
+    或未啟用認證時，回退到 env 憑證的共享單例。
+
+    路由依據是 verify_token 蓋的 claims["auth"]，不能用 client_id：後者取自
+    Odoo login（使用者可影響的字串），login 剛好叫 ENV_ADMIN_CLIENT_ID 的
+    user 會被誤判成 env-admin 而拿到共享連線（權限提升）。
     """
+    access = _safe_get_access_token()
+    if access is not None and (access.claims or {}).get("auth") == "odoo-api-key":
+        # 正常情況直接命中 _user_cache（verify_token 才剛驗過）；快取過期則重驗
+        entry = _authenticate_odoo_token(access.token)
+        if entry is None:
+            raise ToolError("Odoo rejected this session's API key (revoked or expired). Reconnect with a valid key.")
+        return entry.client
     global _client
     if _client is None:
+        # Fail fast 並講清楚：沒設 ODOO_API_KEY 時走到 fallback 路徑，與其讓
+        # placeholder 打到 Odoo 吃一個看不懂的 401，不如直接說明是設定問題。
+        if _env_api_key_missing():
+            raise ToolError(
+                "ODOO_API_KEY is not configured on the server, so the shared fallback "
+                "connection is unavailable. In multi-user mode (MCP_MULTIUSER=true), "
+                "connect with your own Odoo API key as the Bearer token instead."
+            )
         _client = OdooJsonRpcClient.connect(ODOO_URL, ODOO_DATABASE, ODOO_API_KEY)
     return _client
 
 
-# MCP_AUTH_TOKEN 為 opt-in 認證：設定後 HTTP/SSE 的 /mcp 端點要求
-# Authorization: Bearer <token>，未帶或錯誤一律 401；stdio 模式不受 auth 影響。
-# 必須在模組層級掛上（理由同 READONLY_MODE）：fastmcp run / dev 以 import
-# 方式載入，不會執行 __main__。
-# StaticTokenVerifier 官方標註「僅供開發測試」（token 明文存放），本專案接受此點：
-# ODOO_API_KEY 本來就以明文存於同一份環境變數，shared secret 並未擴大暴露面。
+# 認證分三檔（必須在模組層級掛上，理由同 READONLY_MODE：fastmcp run / dev 以
+# import 方式載入，不會執行 __main__）：
+# 1. MCP_MULTIUSER=true → OdooPassthroughVerifier：每人拿自己的 Odoo API key
+#    當 Bearer；MCP_AUTH_TOKEN（若有設）保留為 admin fallback。
+# 2. 僅設 MCP_AUTH_TOKEN → StaticTokenVerifier 單一共用 token（原行為不變）。
+#    官方標註「僅供開發測試」（token 明文存放），本專案接受此點：ODOO_API_KEY
+#    本來就以明文存於同一份環境變數，shared secret 並未擴大暴露面。
+# 3. 都沒設 → 無認證。
 # 注意 /health 是 custom route，不在 auth 保護範圍內（LB probe 需免認證）。
-_auth = StaticTokenVerifier(tokens={MCP_AUTH_TOKEN: {"client_id": "odoo-mcp-client"}}) if MCP_AUTH_TOKEN else None
+_auth: TokenVerifier | None
+if MCP_MULTIUSER:
+    _auth = OdooPassthroughVerifier()
+elif MCP_AUTH_TOKEN:
+    _auth = StaticTokenVerifier(tokens={MCP_AUTH_TOKEN: {"client_id": ENV_ADMIN_CLIENT_ID}})
+else:
+    _auth = None
+
+
+def _warn_if_admin_fallback_unusable() -> None:
+    """MCP_AUTH_TOKEN 進得了門（verify 過）但 ODOO_API_KEY 沒設 → admin fallback
+    第一次呼叫工具就會失敗。這種「認證過了、連線卻是壞的」組合在啟動時先講清楚."""
+    if MCP_MULTIUSER and MCP_AUTH_TOKEN and _env_api_key_missing():
+        print(
+            "⚠️  MCP_AUTH_TOKEN is set but ODOO_API_KEY is missing: the admin fallback "
+            "identity has no working Odoo connection and will fail on first call. "
+            "Set ODOO_API_KEY, or unset MCP_AUTH_TOKEN to run pure multi-user.",
+            file=sys.stderr,
+        )
+
+
+# 模組層級執行（理由同 READONLY_MODE：fastmcp run / dev 不會走 __main__）
+_warn_if_admin_fallback_unusable()
 
 mcp = FastMCP(
     "Odoo MCP Server (JSON-RPC)",
@@ -378,45 +596,76 @@ async def health_check(request):
     return JSONResponse({"status": "healthy", "service": "odoo-mcp-server", "version": __version__})
 
 
+def _upload_token_secret() -> bytes | None:
+    """upload token 的 HMAC key：依序取 UPLOAD_TOKEN_SECRET、MCP_AUTH_TOKEN、
+    （多 user 模式）程序啟動時生成的 secret；都沒有＝upload 不設防（原行為）.
+
+    多 user 模式不能拿各人的 Odoo API key 當 HMAC key（每人不同、會輪替），
+    必須用 server 端固定 secret。
+    """
+    if UPLOAD_TOKEN_SECRET:
+        return UPLOAD_TOKEN_SECRET.encode()
+    if MCP_AUTH_TOKEN:
+        return MCP_AUTH_TOKEN.encode()
+    if MCP_MULTIUSER:
+        return _RUNTIME_UPLOAD_SECRET
+    return None
+
+
 def _make_upload_token() -> str | None:
-    """從 MCP_AUTH_TOKEN 衍生短效 upload token（HMAC、自帶效期、無狀態）.
+    """簽發短效 upload token（HMAC、自帶效期與簽發者、無狀態）.
 
     prepare_upload 的回傳值會進 LLM context（transcript、對話摘要都留得下來），
-    絕不能把 MCP_AUTH_TOKEN 本體交出去——那是整個 server 的 master key。改發衍生
-    token：外洩最多換到「效期內對 /upload 寫檔」的權限。格式
-    "<expiry_unix>.<hmac_sha256_hex>"，驗證只需重算 HMAC，server 不用保存任何狀態。
+    絕不能把任何長效憑證本體交出去。改發衍生 token：外洩最多換到「效期內對
+    /upload 寫檔」的權限。格式 "<expiry_unix>.<user>.<hmac_sha256_hex>"，user
+    為簽發當下的呼叫者身分（多 user 模式下可追溯是誰要上傳），驗證只需重算
+    HMAC，server 不用保存任何狀態。
     """
-    if not MCP_AUTH_TOKEN:
+    secret = _upload_token_secret()
+    if secret is None:
         return None
     expiry = str(int(time.time()) + UPLOAD_TOKEN_TTL_SECONDS)
-    sig = hmac.new(MCP_AUTH_TOKEN.encode(), expiry.encode(), hashlib.sha256).hexdigest()
-    return f"{expiry}.{sig}"
+    access = _safe_get_access_token()
+    payload = f"{expiry}.{access.client_id if access else 'anon'}"
+    sig = hmac.new(secret, payload.encode(), hashlib.sha256).hexdigest()
+    return f"{payload}.{sig}"
 
 
 def _verify_upload_token(token: str) -> bool:
-    """驗證 _make_upload_token 簽發的衍生 token：格式對、未過期、HMAC 相符."""
-    if not MCP_AUTH_TOKEN:
+    """驗證 _make_upload_token 簽發的衍生 token：格式對、未過期、HMAC 相符.
+
+    user 段可能含 "."（email 格式的 login），所以簽名從尾端 rpartition 切出、
+    expiry 從頭端 partition 切出，中間整段視為 user。
+    """
+    secret = _upload_token_secret()
+    if secret is None:
         return False
-    expiry, _, sig = token.partition(".")
+    payload, _, sig = token.rpartition(".")
+    expiry, _, _user = payload.partition(".")
     if not expiry.isdigit() or int(expiry) < time.time():
         return False
-    expected = hmac.new(MCP_AUTH_TOKEN.encode(), expiry.encode(), hashlib.sha256).hexdigest()
+    expected = hmac.new(secret, payload.encode(), hashlib.sha256).hexdigest()
     return secrets.compare_digest(sig, expected)
 
 
 def _check_upload_auth(request) -> bool:
-    """/upload 收兩種 Bearer：MCP_AUTH_TOKEN 本體，或 prepare_upload 簽發的短效衍生
-    token（有設 MCP_AUTH_TOKEN 才驗，與 /mcp 一致；沒設＝不擋）.
+    """/upload 收兩種 Bearer：MCP_AUTH_TOKEN 本體（若有設），或 prepare_upload
+    簽發的短效衍生 token。有任一認證機制（MCP_AUTH_TOKEN 或多 user 模式）就驗，
+    都沒有＝不擋（與 /mcp 一致）.
 
-    custom route 不受 MCP 的 StaticTokenVerifier 保護（/health 就是靠這點免認證），
-    所以這個「會寫檔」的端點必須自己檢查 Bearer，否則等於開放任意人往主機寫檔。
+    custom route 不受 MCP auth 保護（/health 就是靠這點免認證），所以這個
+    「會寫檔」的端點必須自己檢查 Bearer，否則等於開放任意人往主機寫檔。
+    多 user 的 client 一律先呼叫 prepare_upload 換衍生 token（本來就是文件化
+    流程）；不直接收 Odoo API key，避免這條同步路徑得打 Odoo 驗證。
     """
-    if not MCP_AUTH_TOKEN:
+    if not (MCP_AUTH_TOKEN or MCP_MULTIUSER):
         return True
     scheme, _, token = request.headers.get("authorization", "").partition(" ")
     if scheme.lower() != "bearer":
         return False
-    return secrets.compare_digest(token, MCP_AUTH_TOKEN) or _verify_upload_token(token)
+    if MCP_AUTH_TOKEN and secrets.compare_digest(token, MCP_AUTH_TOKEN):
+        return True
+    return _verify_upload_token(token)
 
 
 def _safe_suffix(filename: str) -> str:
@@ -471,7 +720,7 @@ async def upload_file(request):
 
 
 @mcp.resource("odoo://models")
-def list_models_resource(client: OdooJsonRpcClient = Depends(get_shared_client)) -> str:
+def list_models_resource(client: OdooJsonRpcClient = Depends(get_caller_client)) -> str:
     """List all available Odoo models."""
     records = client.search_read(
         "ir.model",
@@ -483,7 +732,7 @@ def list_models_resource(client: OdooJsonRpcClient = Depends(get_shared_client))
 
 
 @mcp.resource("odoo://model/{model_name}")
-def get_model_fields(model_name: str, client: OdooJsonRpcClient = Depends(get_shared_client)) -> str:
+def get_model_fields(model_name: str, client: OdooJsonRpcClient = Depends(get_caller_client)) -> str:
     """Get field information for a specific model using ORM fields_get()."""
     # 使用 fields_get() 取得更完整的欄位資訊
     fields_data = client.fields_get(
@@ -516,7 +765,7 @@ def get_model_fields(model_name: str, client: OdooJsonRpcClient = Depends(get_sh
 
 
 @mcp.resource("odoo://record/{model_name}/{record_id}")
-def get_record(model_name: str, record_id: int, client: OdooJsonRpcClient = Depends(get_shared_client)) -> str:
+def get_record(model_name: str, record_id: int, client: OdooJsonRpcClient = Depends(get_caller_client)) -> str:
     """Get a single record by ID (auto-excludes dangerous fields like binary/image/html)."""
     # 自動排除危險欄位（binary、image、html）
     fields = get_safe_fields(client, model_name)
@@ -527,7 +776,7 @@ def get_record(model_name: str, record_id: int, client: OdooJsonRpcClient = Depe
 
 
 @mcp.resource("odoo://user")
-def get_current_user(client: OdooJsonRpcClient = Depends(get_shared_client)) -> str:
+def get_current_user(client: OdooJsonRpcClient = Depends(get_caller_client)) -> str:
     """Get current logged-in user information."""
     uid = client.get_current_uid()
     if uid is None:
@@ -542,7 +791,7 @@ def get_current_user(client: OdooJsonRpcClient = Depends(get_shared_client)) -> 
 
 
 @mcp.resource("odoo://company")
-def get_current_company(client: OdooJsonRpcClient = Depends(get_shared_client)) -> str:
+def get_current_company(client: OdooJsonRpcClient = Depends(get_caller_client)) -> str:
     """Get current user's company information."""
     # 先取得當前用戶
     uid = client.get_current_uid()
@@ -571,7 +820,7 @@ def get_current_company(client: OdooJsonRpcClient = Depends(get_shared_client)) 
 @handle_tool_errors
 def list_models(
     name_filter: str | None = None,
-    client: OdooJsonRpcClient = Depends(get_shared_client),
+    client: OdooJsonRpcClient = Depends(get_caller_client),
 ) -> str:
     """
     List all available Odoo models.
@@ -616,7 +865,7 @@ def get_fields(
     field_filter: str | None = None,
     fields: list[str] | None = None,
     attributes: list[str] | None = None,
-    client: OdooJsonRpcClient = Depends(get_shared_client),
+    client: OdooJsonRpcClient = Depends(get_caller_client),
 ) -> str:
     """
     Get field information for an Odoo model using ORM fields_get().
@@ -669,7 +918,7 @@ def execute_method(
     method: str,
     args: list | None = None,
     kwargs: dict | None = None,
-    client: OdooJsonRpcClient = Depends(get_shared_client),
+    client: OdooJsonRpcClient = Depends(get_caller_client),
 ) -> str:
     """
     Execute any method on an Odoo model (general-purpose escape hatch).
@@ -716,7 +965,7 @@ def search_records(
     limit: int = 100,
     offset: int = 0,
     order: str | None = None,
-    client: OdooJsonRpcClient = Depends(get_shared_client),
+    client: OdooJsonRpcClient = Depends(get_caller_client),
 ) -> str:
     """
     Search for records in an Odoo model.
@@ -766,7 +1015,7 @@ def search_records(
 def count_records(
     model: str,
     domain: list | None = None,
-    client: OdooJsonRpcClient = Depends(get_shared_client),
+    client: OdooJsonRpcClient = Depends(get_caller_client),
 ) -> str:
     """
     Count records in an Odoo model matching the domain.
@@ -794,7 +1043,7 @@ def read_records(
     model: str,
     ids: list[int],
     fields: list[str] | None = None,
-    client: OdooJsonRpcClient = Depends(get_shared_client),
+    client: OdooJsonRpcClient = Depends(get_caller_client),
 ) -> str:
     """
     Read specific records by their IDs.
@@ -827,7 +1076,7 @@ def read_records(
 def create_record(
     model: str,
     values: dict | list[dict],
-    client: OdooJsonRpcClient = Depends(get_shared_client),
+    client: OdooJsonRpcClient = Depends(get_caller_client),
 ) -> str:
     """
     Create new record(s) in an Odoo model.
@@ -877,7 +1126,7 @@ def update_record(
     model: str,
     ids: list[int],
     values: dict,
-    client: OdooJsonRpcClient = Depends(get_shared_client),
+    client: OdooJsonRpcClient = Depends(get_caller_client),
 ) -> str:
     """
     Update existing records in an Odoo model.
@@ -926,7 +1175,7 @@ def delete_record(
     model: str,
     ids: list[int],
     confirm: bool = False,
-    client: OdooJsonRpcClient = Depends(get_shared_client),
+    client: OdooJsonRpcClient = Depends(get_caller_client),
 ) -> str:
     """
     Delete records from an Odoo model. IRREVERSIBLE operation.
@@ -981,7 +1230,7 @@ def prepare_upload() -> str:
 
     Returns:
         JSON string with endpoint, method, upload_token (null when the server
-        has no MCP_AUTH_TOKEN configured — omit the Authorization header in
+        has no authentication configured — omit the Authorization header in
         that case), expires_in_seconds, and max_bytes.
     """
     token = _make_upload_token()
@@ -1008,7 +1257,7 @@ def add_attachment(
     res_model: str | None = None,
     res_id: int | None = None,
     description: str | None = None,
-    client: OdooJsonRpcClient = Depends(get_shared_client),
+    client: OdooJsonRpcClient = Depends(get_caller_client),
 ) -> str:
     """
     Upload a file attachment to Odoo via ir.attachment.
@@ -1121,7 +1370,13 @@ if __name__ == "__main__":
     if args.transport == "stdio":
         mcp.run()
     else:
-        if not MCP_AUTH_TOKEN:
+        if MCP_MULTIUSER:
+            print(
+                "🔑 MCP_MULTIUSER is enabled: clients authenticate with their own Odoo API key "
+                "as the Bearer token. Use TLS — the key travels on every request.",
+                file=sys.stderr,
+            )
+        elif not MCP_AUTH_TOKEN:
             print(
                 "⚠️  MCP_AUTH_TOKEN is not set: the HTTP/SSE endpoint has NO authentication. "
                 "Anyone who can reach this port gets full ODOO_API_KEY access. "

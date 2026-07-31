@@ -20,6 +20,8 @@
 
 Odoo 19 MCP Server，使用 JSON-2 API 連線。
 
+**✨ 支援多 user**：設定 `MCP_MULTIUSER=true` 後，每個 client 以**自己的 Odoo API key** 認證，權限、操作歸屬、審計紀錄都對應真實 user，不再全部掛在同一個服務帳號上，詳見[多 user 模式](#多-user-模式mcp_multiuser)。
+
 本專案基於 [Odoo 19 JSON-2 API 完整使用指南](https://github.com/twtrubiks/odoo-demo-addons-tutorial/blob/19.0/odoo-json2-client/README.md) 開發。
 
 ![執行畫面](https://cdn.imgpile.com/f/re0866c_xl.png)
@@ -43,7 +45,7 @@ flowchart TB
     subgraph Server["MCP Server (FastMCP)"]
         R[Resources<br/>odoo://models<br/>odoo://user<br/>odoo://company]
         T[Tools<br/>search_records<br/>create_record<br/>update_record]
-        DI[Dependency Injection<br/>get_shared_client]
+        DI[Dependency Injection<br/>get_caller_client]
     end
 
     subgraph RPC["OdooJsonRpcClient"]
@@ -119,6 +121,8 @@ def get_current_user():
 | `ODOO_API_KEY` | API Key 認證 | - |
 | `READONLY_MODE` | 唯讀模式（禁止寫入操作） | `false` |
 | `MCP_AUTH_TOKEN` | HTTP/SSE 模式的 Bearer Token 認證（未設定＝無認證；stdio 不適用），見[安全機制](#安全機制) | -（停用） |
+| `MCP_MULTIUSER` | 多 user 模式：每個 client 拿**自己的 Odoo API key** 當 Bearer token，見[安全機制](#安全機制) | `false` |
+| `UPLOAD_TOKEN_SECRET` | upload token 的 HMAC secret；僅多 worker 部署需要設定（單一程序自動衍生） | - |
 
 建立 `.env` 檔案：
 
@@ -201,7 +205,7 @@ python odoo_mcp_server.py --transport sse --host 0.0.0.0 --port 8000
 
 > ⚠️ **安全提醒**：HTTP 模式預設**沒有認證**——任何連得到該 port 的人都直接繼承
 > `ODOO_API_KEY` 的完整權限。除非 server 只在受信任的內網使用，
-> 否則請務必設定 `MCP_AUTH_TOKEN` 並搭配 TLS，詳見[安全機制](#安全機制)
+> 否則請務必設定 `MCP_AUTH_TOKEN`（或改用多 user 模式 `MCP_MULTIUSER`）並搭配 TLS，詳見[安全機制](#安全機制)
 
 專案提供 `docker-compose.example.yml` 範本，複製後修改即可使用：
 
@@ -235,6 +239,9 @@ services:
       - READONLY_MODE=${READONLY_MODE:-false}
       # HTTP 模式的 Bearer Token 認證（未設定＝無認證，見 README「安全機制」）
       - MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN:-}
+      # 多 user 模式：每個 client 拿自己的 Odoo API key 當 Bearer token，
+      # 權限/審計歸屬真實 user（見「多 user 模式」）
+      # - MCP_MULTIUSER=true
       # HTTP 模式的 Host 標頭防護（DNS rebinding protection，來自底層 MCP SDK）：
       # 用非 localhost 的 IP／網域連進來時，預設會被擋下並回 "Invalid host header"。
       # ⚠️ 快速測試可先全開（勿用於正式環境）：
@@ -263,6 +270,9 @@ services:
 # server 有設 MCP_AUTH_TOKEN 時，需帶 Authorization header
 claude mcp add --transport http odoo-mcp https://your-cloud-server.com:8000/mcp --header "Authorization: Bearer your_random_token_here"
 
+# 多 user 模式（MCP_MULTIUSER=true）：Bearer 改填「自己的 Odoo API key」
+claude mcp add --transport http odoo-mcp https://your-cloud-server.com:8000/mcp --header "Authorization: Bearer <你的 Odoo API key>"
+
 # server 未啟用認證（僅限受信任內網）
 claude mcp add --transport http odoo-mcp https://your-cloud-server.com:8000/mcp
 ```
@@ -286,7 +296,8 @@ claude mcp add --transport http odoo-mcp https://your-cloud-server.com:8000/mcp
 
 > ⚠️ 純 HTTP 下 Bearer token 是明文傳輸，僅適合受信任內網／臨時測試；對外請改用 `https://`（TLS）。
 
-server 未啟用 `MCP_AUTH_TOKEN` 時，`headers` 整段可省略。
+server 未啟用 `MCP_AUTH_TOKEN`、也未開多 user 模式時，`headers` 整段可省略。
+多 user 模式（`MCP_MULTIUSER=true`）下 `headers` **必填**，Bearer 改填**自己的 Odoo API key**，見[多 user 模式](#多-user-模式mcp_multiuser)。
 
 </details>
 
@@ -603,6 +614,7 @@ url = "https://your-cloud-server.com:8000/mcp"
 > 若 server 端設定了 `MCP_AUTH_TOKEN`，需加上 `bearer_token_env_var = "ODOO_MCP_TOKEN"`，
 > 並在執行 Codex 的環境中 `export ODOO_MCP_TOKEN=<與 server MCP_AUTH_TOKEN 相同的值>`；
 > 或改用自訂 `http_headers` 直接填 `Authorization` header。
+> 多 user 模式（`MCP_MULTIUSER=true`）下同理，`ODOO_MCP_TOKEN` 改 export **自己的 Odoo API key**。
 
 </details>
 
@@ -619,6 +631,36 @@ openssl rand -hex 32
 
 - 啟用後 `/mcp` 端點要求 `Authorization: Bearer <token>`，未帶或錯誤一律回 401
 - 未設定時行為與過去版本相同（無認證），但 HTTP/SSE 模式啟動時會在 stderr 印出警告
+
+### 多 user 模式（`MCP_MULTIUSER`）
+
+預設情況下，所有操作都透過 `ODOO_API_KEY` 這一個 Odoo 帳號執行——多人共用時，
+Odoo 端的權限、chatter、審計紀錄全部歸到同一個 user。設定 `MCP_MULTIUSER=true`
+後改為 **pass-through 認證**：
+
+- 每個 user 在 Odoo「偏好設定 → 帳戶安全」產生自己的 API key，直接當
+  HTTP/SSE 連線的 Bearer token（json2 protocol 的 API key 即完整憑證，
+  Odoo 會從 key 解析出擁有者）
+- Server 收到 token 後拿去問 Odoo 驗證（結果快取 5 分鐘、驗證失敗快取 30 秒
+  以防暴力破解），驗證成功即建立**綁該 user API key 的專屬連線**
+- 權限（ACL / record rules）、操作歸屬、審計全部由 Odoo 原生機制處理；
+  撤銷存取 = 在 Odoo 刪除該 API key（最遲 5 分鐘後生效）
+- Server 端**不保存任何使用者資料**，新增/移除 user 都在 Odoo 操作即可
+- `MCP_AUTH_TOKEN` 可並存，作為 admin fallback（走 `ODOO_API_KEY` 的共享連線）；
+  stdio 模式不受影響
+- 純多 user 部署（不設 `MCP_AUTH_TOKEN`、不跑 stdio）可**連 `ODOO_API_KEY` 都不設**
+  ——server 端零長效憑證，設定檔外洩也沒東西可偷。誤走到 fallback 路徑時會收到
+  明確的設定錯誤訊息（不會拿 placeholder 去打 Odoo）
+- Bearer token 就是 Odoo API key 本體，**務必搭配 TLS**
+
+Client 端設定與 `MCP_AUTH_TOKEN` 完全相同（完整範例見[雲端部署（HTTP 模式）](#雲端部署http-模式)），
+只是 Bearer 換成**各自的 Odoo API key**：
+
+```json
+"headers": {
+  "Authorization": "Bearer <你的 Odoo API key>"
+}
+```
 
 ### 附件檔案讀取範圍（`UPLOAD_DIR`）
 
@@ -673,22 +715,19 @@ curl -fsS -F "file=@/local/invoice.png" \
 - 寫入工具（`create_record`、`update_record`、`delete_record`、`execute_method`、`add_attachment`）在註冊時即被停用——LLM 看不到這些工具，直接呼叫也會被拒絕
 - 停用發生在模組層級，任何啟動方式（`python odoo_mcp_server.py`、`fastmcp run`、`fastmcp dev`）都同樣生效
 
-### 刪除二次確認
+### 刪除二次確認與 `execute_method` 的安全邊界
 
-`delete_record` 內建 confirm 機制，LLM 必須先以 `confirm=False` 呼叫取得確認提示，經使用者同意後才能以 `confirm=True` 執行刪除。
-`execute_method` 已攔下 `unlink`，無法用它繞過此確認流程。
+`delete_record` 內建 confirm 機制：LLM 必須先以 `confirm=False` 呼叫取得確認提示，經使用者同意後才能以 `confirm=True` 執行刪除。
 
 > 注意：confirm 參數由 LLM 自行填入，屬於「引導 LLM」層級的防護，
 > 並非強制性的安全邊界（LLM 理論上可直接傳 `confirm=True`）。
 
-### `execute_method` 的安全邊界
-
 `execute_method` 是萬用入口（escape hatch），用來呼叫沒有專用工具的模型方法，請理解其風險：
 
-- ORM 原語 `unlink` 已被攔下，會導向 `delete_record` 的二次確認流程
+- ORM 原語 `unlink` 已被攔下，會導向 `delete_record` 的二次確認流程，無法藉此繞過確認
 - 但 `action_confirm`、`action_post`、`button_validate` 這類會改資料的**業務方法不設防**——
   Odoo 有上千個模型方法，server 無法枚舉哪些會寫入資料庫
-- 真正的安全邊界在應該是給 MCP 使用**低權限的 Odoo 使用者** API key（最小權限原則）
+- 真正的安全邊界應該是給 MCP 使用**低權限的 Odoo 使用者** API key（最小權限原則）
 
 ## 健康檢查
 

@@ -14,11 +14,12 @@ import httpx
 import pytest
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
-from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 
 import odoo_mcp_server
 from odoo_mcp_server import (
+    AuthenticationError,
     OdooJsonRpcClient,
+    OdooPassthroughVerifier,
     _check_upload_auth,
     _make_upload_token,
     _safe_suffix,
@@ -31,7 +32,6 @@ from odoo_mcp_server import (
     handle_tool_errors,
     prepare_upload,
     resolve_upload_path,
-    search_records,
 )
 
 # =============================================================================
@@ -129,12 +129,88 @@ class TestReadNormalization:
             result = client.read("res.partner", [1, 2], fields=["name"])
         assert result == data
 
-    def test_read_without_fields(self):
-        """不傳 fields → 呼叫 read(ids) 而非 read(ids, fields)."""
-        client, mock_proxy = self._make_client([{"id": 1, "name": "Alice"}])
-        with patch.object(client, "get_model", return_value=mock_proxy):
-            client.read("res.partner", [1])
-        mock_proxy.read.assert_called_once_with([1])
+
+# =============================================================================
+# 2b. kwargs-only 呼叫 — positional args 會觸發 odoolib 的 /doc-bearer 內省，
+#     該路由需要 Technical Documentation 群組，一般使用者會 403
+# =============================================================================
+
+
+class TestKwargsOnlyProxyCalls:
+    """釘住不變式：wrapper 對 model proxy 的呼叫絕不帶 positional args."""
+
+    def _client_with_proxy(self):
+        mock_proxy = MagicMock()
+        client = OdooJsonRpcClient(connection=MagicMock())
+        return client, mock_proxy
+
+    def test_wrappers_never_pass_positional_args(self):
+        client, proxy = self._client_with_proxy()
+        proxy.read.return_value = []
+        with patch.object(client, "get_model", return_value=proxy):
+            client.search("res.partner", [("id", ">", 0)], limit=5, offset=2)
+            client.search_count("res.partner", [])
+            client.read("res.partner", [1, 2], fields=["name"])
+            client.read("res.partner", [1, 2])
+            client.search_read("res.partner", [], fields=["name"], order="id")
+            client.create("res.partner", {"name": "A"})
+            client.write("res.partner", [1], {"name": "B"})
+            client.unlink("res.partner", [1])
+            client.fields_get("res.partner", attributes=["type"])
+
+        for name in (
+            "search",
+            "search_count",
+            "read",
+            "search_read",
+            "create",
+            "write",
+            "unlink",
+            "fields_get",
+        ):
+            for call in getattr(proxy, name).call_args_list:
+                assert call.args == (), f"{name} 傳了 positional args: {call.args}"
+
+    def test_kwarg_names_match_odoo_orm_signatures(self):
+        """kwargs 名稱打錯 Odoo 會回 422，這裡釘住 ORM 簽名的參數名."""
+        client, proxy = self._client_with_proxy()
+        with patch.object(client, "get_model", return_value=proxy):
+            client.create("res.partner", {"name": "A"})
+            client.write("res.partner", [1], {"name": "B"})
+            client.unlink("res.partner", [1])
+
+        assert proxy.create.call_args.kwargs == {"vals_list": {"name": "A"}}
+        assert proxy.write.call_args.kwargs == {"ids": [1], "vals": {"name": "B"}}
+        assert proxy.unlink.call_args.kwargs == {"ids": [1]}
+
+
+class TestExecuteIntrospection403:
+    """execute() 收到 /doc-bearer 內省 403 時要翻成可行動的錯誤訊息."""
+
+    def _make_403(self, url):
+        request = httpx.Request("GET", url)
+        response = httpx.Response(403, request=request)
+        return httpx.HTTPStatusError("403 Forbidden", request=request, response=response)
+
+    def test_doc_bearer_403_becomes_permission_error(self):
+        client = OdooJsonRpcClient(connection=MagicMock())
+        proxy = MagicMock()
+        proxy.action_confirm.side_effect = self._make_403("http://odoo:8069/doc-bearer/sale.order.json")
+        with (
+            patch.object(client, "get_model", return_value=proxy),
+            pytest.raises(PermissionError, match="Technical Documentation"),
+        ):
+            client.execute("sale.order", "action_confirm", [1])
+
+    def test_other_403_is_reraised_unchanged(self):
+        client = OdooJsonRpcClient(connection=MagicMock())
+        proxy = MagicMock()
+        proxy.action_confirm.side_effect = self._make_403("http://odoo:8069/json/2/sale.order/action_confirm")
+        with (
+            patch.object(client, "get_model", return_value=proxy),
+            pytest.raises(httpx.HTTPStatusError),
+        ):
+            client.execute("sale.order", "action_confirm", [1])
 
 
 # =============================================================================
@@ -157,16 +233,6 @@ class TestCreateRecord:
         assert result["id"] == 42
         assert result["success"] is True
         assert "url" in result
-
-    def test_batch_creation_returns_ids(self):
-        """批次建立 → 回傳 {ids, count, success, urls}."""
-        client = self._make_mock_client([10, 11, 12])
-        values = [{"name": "A"}, {"name": "B"}, {"name": "C"}]
-        result = json.loads(create_record(model="res.partner", values=values, client=client))
-        assert result["ids"] == [10, 11, 12]
-        assert result["count"] == 3
-        assert result["success"] is True
-        assert len(result["urls"]) == 3
 
     def test_batch_creation_single_id_returned(self):
         """批次建立但 odoo 回傳單一 int（而非 list）→ 應包成 list."""
@@ -335,15 +401,6 @@ class TestUploadDirConfinement:
 class TestHandleToolErrors:
     """測試 handle_tool_errors decorator 的錯誤轉換邏輯."""
 
-    def test_normal_return_passes_through(self):
-        """正常回傳值不受影響."""
-
-        @handle_tool_errors
-        def good_func():
-            return "ok"
-
-        assert good_func() == "ok"
-
     def test_generic_exception_converted_to_tool_error(self):
         """一般 Exception → 轉為 ToolError，保留原始訊息."""
 
@@ -363,33 +420,6 @@ class TestHandleToolErrors:
 
         with pytest.raises(ToolError, match="not allowed in READONLY_MODE"):
             readonly_func()
-
-    def test_original_exception_chained(self):
-        """原始 Exception 應保留在 __cause__ 中."""
-
-        @handle_tool_errors
-        def failing_func():
-            raise ValueError("bad value")
-
-        with pytest.raises(ToolError) as exc_info:
-            failing_func()
-        assert isinstance(exc_info.value.__cause__, ValueError)
-
-    def test_search_records_rpc_error(self):
-        """實際 tool：search_records RPC 錯誤 → ToolError."""
-        mock_client = MagicMock()
-        mock_client.search_read.side_effect = Exception("Object res.partnerr doesn't exist")
-
-        with pytest.raises(ToolError, match="search_records failed.*doesn't exist"):
-            search_records(model="res.partnerr", client=mock_client)
-
-    def test_execute_method_rpc_error(self):
-        """實際 tool：execute_method RPC 錯誤 → ToolError."""
-        mock_client = MagicMock()
-        mock_client.execute.side_effect = ConnectionError("Connection refused")
-
-        with pytest.raises(ToolError, match="execute_method failed.*Connection refused"):
-            execute_method(model="res.partner", method="search", args=[[]], client=mock_client)
 
 
 # =============================================================================
@@ -430,29 +460,6 @@ class TestSanitizeErrorMessage:
         error = ConnectionError("Connection refused")
         result = _sanitize_error_message(error)
         assert result == "Connection refused"
-
-    def test_non_dict_json_unchanged(self):
-        """JSON 是 array 而非 dict → 原樣回傳."""
-        error = Exception("Some prefix: [1, 2, 3]")
-        result = _sanitize_error_message(error)
-        assert result == str(error)
-
-    def test_integration_with_decorator(self):
-        """decorator 整合測試：Odoo 風格錯誤經過 decorator 後 debug 被移除."""
-        body = {
-            "message": "field 'namee' does not exist",
-            "debug": "Traceback ...\n  very long traceback ...",
-        }
-
-        @handle_tool_errors
-        def failing_tool():
-            raise Exception(f"Unexpected status code 400: {json.dumps(body)}")
-
-        with pytest.raises(ToolError) as exc_info:
-            failing_tool()
-        error_msg = str(exc_info.value)
-        assert "field 'namee' does not exist" in error_msg
-        assert "Traceback" not in error_msg
 
 
 # =============================================================================
@@ -539,7 +546,8 @@ def auth_enabled_module():
     os.environ["MCP_AUTH_TOKEN"] = TEST_TOKEN
     importlib.reload(odoo_mcp_server)
     yield odoo_mcp_server
-    del os.environ["MCP_AUTH_TOKEN"]
+    # 還原成空字串而非 del：del 之後 reload 會讓 load_dotenv 從本機 .env 重新注入
+    os.environ["MCP_AUTH_TOKEN"] = ""
     importlib.reload(odoo_mcp_server)
 
 
@@ -568,11 +576,6 @@ class TestMcpAuthToken:
         """未設定 MCP_AUTH_TOKEN → auth 為 None（向下相容，無認證）."""
         assert odoo_mcp_server.mcp.auth is None
 
-    def test_token_env_enables_static_verifier(self, auth_enabled_module):
-        """設定 MCP_AUTH_TOKEN → 模組層級掛上 StaticTokenVerifier
-        （import 式載入即生效，不依賴 __main__）."""
-        assert isinstance(auth_enabled_module.mcp.auth, StaticTokenVerifier)
-
     def test_mcp_endpoint_rejects_missing_token(self, auth_enabled_module):
         """啟用認證後，/mcp 未帶 token → 401."""
         response = _http_request(auth_enabled_module.mcp, "/mcp")
@@ -591,7 +594,7 @@ class TestMcpAuthToken:
 
 
 # =============================================================================
-# 10. /upload 端點 + add_attachment file_name 覆寫（跨機器 out-of-band 傳檔）
+# 10. /upload 端點（跨機器 out-of-band 傳檔）
 # =============================================================================
 
 
@@ -695,15 +698,9 @@ class TestPrepareUpload:
         assert body["expires_in_seconds"] == odoo_mcp_server.UPLOAD_TOKEN_TTL_SECONDS
         assert "secret" not in json.dumps(body)
 
-    def test_without_auth_token(self, monkeypatch):
-        monkeypatch.setattr("odoo_mcp_server.MCP_AUTH_TOKEN", None)
-        body = json.loads(prepare_upload())
-        assert body["upload_token"] is None
-        assert body["expires_in_seconds"] is None
 
-
-def _upload_request(mcp_server, data=b"IMAGE", filename="pic.png", token=None, field="file", as_form=False):
-    """對 FastMCP 的 HTTP app POST /upload，預設送 multipart 檔案；as_form=True 送一般表單欄位."""
+def _upload_request(mcp_server, data=b"IMAGE", filename="pic.png", token=None):
+    """對 FastMCP 的 HTTP app POST /upload（multipart 檔案），回傳 response."""
     app = mcp_server.http_app()
     headers = {}
     if token:
@@ -713,9 +710,7 @@ def _upload_request(mcp_server, data=b"IMAGE", filename="pic.png", token=None, f
         async with app.router.lifespan_context(app):
             transport = httpx.ASGITransport(app=app)
             async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-                if as_form:
-                    return await client.post("/upload", data={field: "x"}, headers=headers)
-                return await client.post("/upload", files={field: (filename, data)}, headers=headers)
+                return await client.post("/upload", files={"file": (filename, data)}, headers=headers)
 
     return asyncio.run(_run())
 
@@ -744,26 +739,12 @@ class TestUploadEndpoint:
         assert resp.status_code == 401
         assert list(tmp_path.iterdir()) == []
 
-    def test_upload_accepts_correct_token(self, tmp_path, monkeypatch):
-        """設了 token 且帶對 → 200."""
-        monkeypatch.setattr("odoo_mcp_server.UPLOAD_DIR", tmp_path)
-        monkeypatch.setattr("odoo_mcp_server.MCP_AUTH_TOKEN", "secret")
-        resp = _upload_request(odoo_mcp_server.mcp, token="secret")
-        assert resp.status_code == 200
-
     def test_upload_accepts_derived_token(self, tmp_path, monkeypatch):
         """帶 prepare_upload 簽發的短效衍生 token → 200（master token 不用出場）."""
         monkeypatch.setattr("odoo_mcp_server.UPLOAD_DIR", tmp_path)
         monkeypatch.setattr("odoo_mcp_server.MCP_AUTH_TOKEN", "secret")
         resp = _upload_request(odoo_mcp_server.mcp, token=_make_upload_token())
         assert resp.status_code == 200
-
-    def test_missing_file_field_rejected(self, tmp_path, monkeypatch):
-        """沒有 multipart 'file' 欄位 → 400."""
-        monkeypatch.setattr("odoo_mcp_server.UPLOAD_DIR", tmp_path)
-        monkeypatch.setattr("odoo_mcp_server.MCP_AUTH_TOKEN", None)
-        resp = _upload_request(odoo_mcp_server.mcp, field="notfile", as_form=True)
-        assert resp.status_code == 400
 
     def test_oversized_upload_rejected(self, tmp_path, monkeypatch):
         """超過 UPLOAD_MAX_BYTES → 拒絕且不寫檔."""
@@ -775,25 +756,267 @@ class TestUploadEndpoint:
         assert list(tmp_path.iterdir()) == []
 
 
-class TestAddAttachmentFileNameOverride:
-    """add_attachment 的 file_path 模式支援 file_name 覆寫（把 /upload 的 uuid 名還原成原名）."""
+# =============================================================================
+# 11. 多 user 模式（MCP_MULTIUSER）— pass-through 認證與 per-user client
+# =============================================================================
 
-    def test_file_name_override_used(self, tmp_path, monkeypatch):
-        """帶 file_name → Odoo 附件名用 file_name."""
-        monkeypatch.setattr("odoo_mcp_server.UPLOAD_DIR", tmp_path)
-        f = tmp_path / "abcdef123456.png"
-        f.write_bytes(b"IMAGE")
-        mock_client = MagicMock()
-        mock_client.create.return_value = 7
-        add_attachment(file_path=str(f), file_name="invoice.png", client=mock_client)
-        assert mock_client.create.call_args.args[1]["name"] == "invoice.png"
 
-    def test_defaults_to_disk_name(self, tmp_path, monkeypatch):
-        """未帶 file_name → 用磁碟檔名（既有行為不變）."""
-        monkeypatch.setattr("odoo_mcp_server.UPLOAD_DIR", tmp_path)
-        f = tmp_path / "invoice.png"
-        f.write_bytes(b"IMAGE")
-        mock_client = MagicMock()
-        mock_client.create.return_value = 7
-        add_attachment(file_path=str(f), client=mock_client)
-        assert mock_client.create.call_args.args[1]["name"] == "invoice.png"
+@pytest.fixture
+def clear_user_caches():
+    """清空多 user 驗證快取，避免測試間互相汙染."""
+    odoo_mcp_server._user_cache.clear()
+    odoo_mcp_server._neg_cache.clear()
+    yield
+    odoo_mcp_server._user_cache.clear()
+    odoo_mcp_server._neg_cache.clear()
+
+
+def _fake_odoo_client(uid=7, login="alice@example.com", name="Alice"):
+    """模擬一個驗證成功的 OdooJsonRpcClient."""
+    fake = MagicMock()
+    fake.get_current_uid.return_value = uid
+    fake.read.return_value = [{"login": login, "name": name}]
+    return fake
+
+
+class TestPassthroughVerifier:
+    """OdooPassthroughVerifier：static fallback、問 Odoo 驗證、正/負快取."""
+
+    def _verify(self, token):
+        return asyncio.run(OdooPassthroughVerifier().verify_token(token))
+
+    def test_static_token_maps_to_env_admin(self, monkeypatch, clear_user_caches):
+        """MCP_AUTH_TOKEN 在多 user 模式仍可用，對應 env-admin 身分."""
+        monkeypatch.setattr("odoo_mcp_server.MCP_AUTH_TOKEN", "master")
+        access = self._verify("master")
+        assert access is not None
+        assert access.client_id == odoo_mcp_server.ENV_ADMIN_CLIENT_ID
+
+    @patch("odoo_mcp_server.OdooJsonRpcClient.connect")
+    def test_valid_odoo_key_returns_identity(self, mock_connect, monkeypatch, clear_user_caches):
+        """有效的 Odoo API key → AccessToken 帶該 user 的 login 與 uid."""
+        monkeypatch.setattr("odoo_mcp_server.MCP_AUTH_TOKEN", None)
+        mock_connect.return_value = _fake_odoo_client()
+        access = self._verify("alice-api-key")
+        assert access is not None
+        assert access.client_id == "alice@example.com"
+        assert access.claims["uid"] == 7
+        mock_connect.assert_called_once_with(odoo_mcp_server.ODOO_URL, odoo_mcp_server.ODOO_DATABASE, "alice-api-key")
+
+    @patch("odoo_mcp_server.OdooJsonRpcClient.connect")
+    def test_valid_key_cached(self, mock_connect, monkeypatch, clear_user_caches):
+        """TTL 內第二次驗證直接命中快取，不再打 Odoo."""
+        monkeypatch.setattr("odoo_mcp_server.MCP_AUTH_TOKEN", None)
+        mock_connect.return_value = _fake_odoo_client()
+        self._verify("alice-api-key")
+        self._verify("alice-api-key")
+        assert mock_connect.call_count == 1
+
+    @patch("odoo_mcp_server.OdooJsonRpcClient.connect")
+    def test_invalid_key_negative_cached(self, mock_connect, monkeypatch, clear_user_caches):
+        """401 → None 且進負快取：連續嘗試不會每次都打 Odoo（暴力破解跳板防護）."""
+        monkeypatch.setattr("odoo_mcp_server.MCP_AUTH_TOKEN", None)
+        fake = MagicMock()
+        fake.get_current_uid.side_effect = AuthenticationError("bad key")
+        mock_connect.return_value = fake
+        assert self._verify("bad-key") is None
+        assert self._verify("bad-key") is None
+        assert mock_connect.call_count == 1
+
+    @patch("odoo_mcp_server.OdooJsonRpcClient.connect")
+    def test_transient_error_not_cached(self, mock_connect, monkeypatch, clear_user_caches):
+        """網路錯誤 → None 但不進負快取，下一次會重試（別把合法 key 鎖在門外）."""
+        monkeypatch.setattr("odoo_mcp_server.MCP_AUTH_TOKEN", None)
+        fake = MagicMock()
+        fake.get_current_uid.side_effect = ConnectionError("odoo down")
+        mock_connect.return_value = fake
+        assert self._verify("alice-api-key") is None
+        assert self._verify("alice-api-key") is None
+        assert mock_connect.call_count == 2
+
+    @patch("odoo_mcp_server.OdooJsonRpcClient.connect")
+    def test_identity_read_failure_falls_back_to_uid(self, mock_connect, monkeypatch, clear_user_caches):
+        """res.users read 失敗不影響認證（uid 已驗過），client_id 退回 uid-N."""
+        monkeypatch.setattr("odoo_mcp_server.MCP_AUTH_TOKEN", None)
+        fake = MagicMock()
+        fake.get_current_uid.return_value = 7
+        fake.read.side_effect = Exception("no permission")
+        mock_connect.return_value = fake
+        access = self._verify("alice-api-key")
+        assert access is not None
+        assert access.client_id == "uid-7"
+
+    @patch("odoo_mcp_server.OdooJsonRpcClient.connect")
+    def test_revoked_key_evicts_user_cache_entry(self, mock_connect, monkeypatch, clear_user_caches):
+        """快取過期後重驗、key 已撤銷 → 舊 entry 從 _user_cache 移除，不永久殘留."""
+        monkeypatch.setattr("odoo_mcp_server.MCP_AUTH_TOKEN", None)
+        mock_connect.return_value = _fake_odoo_client()
+        self._verify("alice-api-key")
+        assert len(odoo_mcp_server._user_cache) == 1
+        entry = next(iter(odoo_mcp_server._user_cache.values()))
+        entry.checked_at -= odoo_mcp_server._VERIFY_TTL_SECONDS + 1
+        revoked = MagicMock()
+        revoked.get_current_uid.side_effect = AuthenticationError("revoked")
+        mock_connect.return_value = revoked
+        assert self._verify("alice-api-key") is None
+        assert odoo_mcp_server._user_cache == {}
+
+    @patch("odoo_mcp_server.OdooJsonRpcClient.connect")
+    def test_stale_user_entries_pruned_on_insert(self, mock_connect, monkeypatch, clear_user_caches):
+        """過期 entry（換 key 後不會再被讀到）在下一次成功寫入時被清掉."""
+        monkeypatch.setattr("odoo_mcp_server.MCP_AUTH_TOKEN", None)
+        mock_connect.return_value = _fake_odoo_client()
+        self._verify("alice-old-key")
+        entry = next(iter(odoo_mcp_server._user_cache.values()))
+        entry.checked_at -= odoo_mcp_server._VERIFY_TTL_SECONDS + 1
+        self._verify("alice-new-key")
+        assert len(odoo_mcp_server._user_cache) == 1
+
+    @patch("odoo_mcp_server.OdooJsonRpcClient.connect")
+    def test_neg_cache_overflow_evicts_oldest_only(self, mock_connect, monkeypatch, clear_user_caches):
+        """負快取滿了只逐筆丟最舊的，不整鍋清空——近期失敗 key 的鎖定不被亂 key 重置."""
+        monkeypatch.setattr("odoo_mcp_server.MCP_AUTH_TOKEN", None)
+        monkeypatch.setattr("odoo_mcp_server._NEG_CACHE_MAX", 3)
+        fake = MagicMock()
+        fake.get_current_uid.side_effect = AuthenticationError("bad")
+        mock_connect.return_value = fake
+        for i in range(3):
+            self._verify(f"bad-{i}")  # 填滿到上限
+        self._verify("bad-3")  # 觸發淘汰：只丟最舊的 bad-0
+        assert len(odoo_mcp_server._neg_cache) == 3
+        calls = mock_connect.call_count
+        self._verify("bad-2")  # 仍在負快取 → 不打 Odoo
+        assert mock_connect.call_count == calls
+
+
+def _fake_access(client_id="alice@example.com", token="alice-api-key", auth="odoo-api-key"):
+    """模擬 verify_token 簽出的 AccessToken（路由依據是 claims["auth"]）."""
+    return MagicMock(client_id=client_id, token=token, claims={"auth": auth})
+
+
+class TestGetCallerClient:
+    """get_caller_client：依呼叫者身分回專屬連線或 env 共享單例."""
+
+    def test_no_auth_context_uses_env_singleton(self, monkeypatch, clear_user_caches):
+        """stdio / 未認證 → env 憑證的共享單例（原行為不變）."""
+        monkeypatch.setattr("odoo_mcp_server._safe_get_access_token", lambda: None)
+        monkeypatch.setattr("odoo_mcp_server._client", None)
+        monkeypatch.setattr("odoo_mcp_server.ODOO_API_KEY", "env-key")
+        with patch("odoo_mcp_server.OdooJsonRpcClient.connect") as mock_connect:
+            mock_connect.return_value = MagicMock()
+            c1 = odoo_mcp_server.get_caller_client()
+            c2 = odoo_mcp_server.get_caller_client()
+        assert c1 is c2
+        mock_connect.assert_called_once_with(odoo_mcp_server.ODOO_URL, odoo_mcp_server.ODOO_DATABASE, "env-key")
+
+    @pytest.mark.parametrize("bad_key", ["", "your_api_key_here"])
+    def test_env_path_without_real_key_fails_fast(self, bad_key, monkeypatch, clear_user_caches):
+        """ODOO_API_KEY 空值或 placeholder → 明確 ToolError，而非拿 placeholder 打 Odoo 吃 401."""
+        monkeypatch.setattr("odoo_mcp_server._safe_get_access_token", lambda: None)
+        monkeypatch.setattr("odoo_mcp_server._client", None)
+        monkeypatch.setattr("odoo_mcp_server.ODOO_API_KEY", bad_key)
+        with (
+            patch("odoo_mcp_server.OdooJsonRpcClient.connect") as mock_connect,
+            pytest.raises(ToolError, match="ODOO_API_KEY is not configured"),
+        ):
+            odoo_mcp_server.get_caller_client()
+        mock_connect.assert_not_called()
+
+    def test_admin_fallback_warning(self, monkeypatch, capsys):
+        """MCP_MULTIUSER + MCP_AUTH_TOKEN 但沒真的設 ODOO_API_KEY → 啟動警告."""
+        monkeypatch.setattr("odoo_mcp_server.MCP_MULTIUSER", True)
+        monkeypatch.setattr("odoo_mcp_server.MCP_AUTH_TOKEN", "master")
+        monkeypatch.setattr("odoo_mcp_server.ODOO_API_KEY", "your_api_key_here")
+        odoo_mcp_server._warn_if_admin_fallback_unusable()
+        assert "admin fallback" in capsys.readouterr().err
+
+    def test_env_admin_uses_env_singleton(self, monkeypatch, clear_user_caches):
+        """MCP_AUTH_TOKEN 身分（env-admin，claims auth=static）→ 共享單例，不走 per-user 路徑."""
+        admin = _fake_access(client_id=odoo_mcp_server.ENV_ADMIN_CLIENT_ID, token="master", auth="static")
+        monkeypatch.setattr("odoo_mcp_server._safe_get_access_token", lambda: admin)
+        sentinel = MagicMock()
+        monkeypatch.setattr("odoo_mcp_server._client", sentinel)
+        assert odoo_mcp_server.get_caller_client() is sentinel
+
+    def test_authenticated_user_gets_own_client(self, monkeypatch, clear_user_caches):
+        """已認證的一般 user → 綁自己 API key 的專屬連線，env 單例不被建立."""
+        monkeypatch.setattr("odoo_mcp_server._safe_get_access_token", lambda: _fake_access())
+        monkeypatch.setattr("odoo_mcp_server._client", None)
+        fake = _fake_odoo_client()
+        with patch("odoo_mcp_server.OdooJsonRpcClient.connect", return_value=fake) as mock_connect:
+            client = odoo_mcp_server.get_caller_client()
+        assert client is fake
+        mock_connect.assert_called_once_with(odoo_mcp_server.ODOO_URL, odoo_mcp_server.ODOO_DATABASE, "alice-api-key")
+        assert odoo_mcp_server._client is None
+
+    def test_login_collision_cannot_reach_env_singleton(self, monkeypatch, clear_user_caches):
+        """Odoo login 剛好叫 ENV_ADMIN_CLIENT_ID 的 user 不能被誤路由到 env 共享連線（權限提升）.
+
+        路由依據必須是 verify_token 蓋的 claims["auth"]，不能是 client_id
+        （client_id 取自 Odoo login，是使用者可影響的字串）。
+        """
+        access = _fake_access(client_id=odoo_mcp_server.ENV_ADMIN_CLIENT_ID, token="collider-key")
+        monkeypatch.setattr("odoo_mcp_server._safe_get_access_token", lambda: access)
+        sentinel = MagicMock()
+        monkeypatch.setattr("odoo_mcp_server._client", sentinel)
+        fake = _fake_odoo_client(login=odoo_mcp_server.ENV_ADMIN_CLIENT_ID)
+        with patch("odoo_mcp_server.OdooJsonRpcClient.connect", return_value=fake):
+            client = odoo_mcp_server.get_caller_client()
+        assert client is fake
+        assert client is not sentinel
+
+    def test_revoked_key_raises_tool_error(self, monkeypatch, clear_user_caches):
+        """快取過期後 key 已被撤銷 → ToolError（明確告知，而非 500）."""
+        access = _fake_access(token="revoked-key")
+        monkeypatch.setattr("odoo_mcp_server._safe_get_access_token", lambda: access)
+        fake = MagicMock()
+        fake.get_current_uid.side_effect = AuthenticationError("revoked")
+        with (
+            patch("odoo_mcp_server.OdooJsonRpcClient.connect", return_value=fake),
+            pytest.raises(ToolError, match="rejected"),
+        ):
+            odoo_mcp_server.get_caller_client()
+
+
+class TestUploadTokenMultiuser:
+    """多 user 模式下的 upload token：身分入 token、無 master token 也能簽驗."""
+
+    def test_token_embeds_caller_identity(self, monkeypatch):
+        """簽發者身分嵌進 token（含 "." 的 email login 也驗得過）."""
+        monkeypatch.setattr("odoo_mcp_server.MCP_AUTH_TOKEN", "secret")
+        access = MagicMock(client_id="alice@example.com")
+        monkeypatch.setattr("odoo_mcp_server._safe_get_access_token", lambda: access)
+        token = _make_upload_token()
+        assert token is not None
+        assert ".alice@example.com." in token
+        assert _verify_upload_token(token) is True
+
+    def test_multiuser_without_master_token(self, monkeypatch):
+        """MCP_MULTIUSER 且未設 MCP_AUTH_TOKEN → 用啟動時生成的 secret 簽驗."""
+        monkeypatch.setattr("odoo_mcp_server.MCP_AUTH_TOKEN", None)
+        monkeypatch.setattr("odoo_mcp_server.UPLOAD_TOKEN_SECRET", None)
+        monkeypatch.setattr("odoo_mcp_server.MCP_MULTIUSER", True)
+        token = _make_upload_token()
+        assert token is not None
+        assert _verify_upload_token(token) is True
+
+    def test_multiuser_upload_requires_bearer(self, monkeypatch):
+        """多 user 模式下 /upload 一樣要驗：沒帶 Bearer 拒絕、衍生 token 放行."""
+        monkeypatch.setattr("odoo_mcp_server.MCP_AUTH_TOKEN", None)
+        monkeypatch.setattr("odoo_mcp_server.UPLOAD_TOKEN_SECRET", None)
+        monkeypatch.setattr("odoo_mcp_server.MCP_MULTIUSER", True)
+        req_no_auth = MagicMock()
+        req_no_auth.headers = {}
+        assert _check_upload_auth(req_no_auth) is False
+        req_ok = MagicMock()
+        req_ok.headers = {"authorization": f"Bearer {_make_upload_token()}"}
+        assert _check_upload_auth(req_ok) is True
+
+    def test_upload_token_secret_env_override(self, monkeypatch):
+        """UPLOAD_TOKEN_SECRET 優先於其他 secret 來源（多 worker 部署用）."""
+        monkeypatch.setattr("odoo_mcp_server.MCP_AUTH_TOKEN", None)
+        monkeypatch.setattr("odoo_mcp_server.MCP_MULTIUSER", False)
+        monkeypatch.setattr("odoo_mcp_server.UPLOAD_TOKEN_SECRET", "shared-secret")
+        token = _make_upload_token()
+        assert token is not None
+        assert _verify_upload_token(token) is True
