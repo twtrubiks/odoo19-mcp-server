@@ -29,7 +29,7 @@ Odoo 19 MCP Server，使用 JSON-2 API 連線。
 ## 技術棧
 
 - **Python**: 3.13
-- **FastMCP**: >=3.0.0,<4.0.0
+- **FastMCP**: >=4.1.0,<5.0.0
 - **odoo-client-lib**: 2.0.1 (JSON-2 API)
 
 ## 架構
@@ -750,7 +750,7 @@ HTTP/SSE transport 模式下提供 `/health` 端點：
 
 ```bash
 curl http://localhost:8000/health
-# {"status": "healthy", "service": "odoo-mcp-server", "version": "1.0.0"}
+# {"status": "healthy", "service": "odoo-mcp-server", "version": "1.2.0"}
 ```
 
 適用於 Docker healthcheck、Kubernetes probe、load balancer 探活。stdio 模式下不影響。
